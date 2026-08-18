@@ -48,6 +48,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Generate a throwaway SSH key
+        # locals.tf reads the operator's public key with
+        # `file(pathexpand(var.ssh_public_key_path))`, so the configuration cannot
+        # be evaluated anywhere that file is absent. `terraform validate` does not
+        # evaluate it and passes regardless; tflint DOES, and fails while building
+        # the configuration with "no file exists at /home/runner/.ssh/id_ed25519.pub".
+        #
+        # Generated rather than committed: a placeholder key in the repository is a
+        # thing future readers have to reason about, and one more string for a
+        # secret scanner to argue with. This one exists for 30 seconds and
+        # authenticates nothing -- CI never connects to a host.
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -q -t ed25519 -N '' -C 'ci@throwaway' -f ~/.ssh/id_ed25519
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}

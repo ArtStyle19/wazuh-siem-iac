@@ -5,8 +5,10 @@ locals {
   # networks drift out of sync with their documentation.
   # ---------------------------------------------------------------------------
   gateway_ip = cidrhost(var.network_cidr, 1)
-  netmask    = cidrnetmask(var.network_cidr)
-  prefix     = tonumber(split("/", var.network_cidr)[1])
+  # No `netmask` here: cloud-init's network-config takes the prefix length, not a
+  # dotted mask, so a netmask local would be a value nothing consumes. tflint's
+  # terraform_unused_declarations rule catches exactly that.
+  prefix = tonumber(split("/", var.network_cidr)[1])
 
   wazuh_ip = cidrhost(var.network_cidr, var.network_host_index)
 
