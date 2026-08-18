@@ -1,0 +1,15 @@
+---
+# Install with: make deps   (ansible-galaxy collection install -r requirements.yml)
+#
+# Pinned with `>=` rather than exact versions: these are stable collections with
+# additive APIs, and pinning them exactly makes the project fail on a machine
+# whose distribution ships something newer.
+collections:
+  - name: community.docker
+    version: ">=3.10.0"
+
+  - name: community.general
+    version: ">=8.0.0"
+
+  - name: ansible.posix
+    version: ">=1.5.0"

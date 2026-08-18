@@ -1,0 +1,54 @@
+---
+- name: Set the system timezone
+  community.general.timezone:
+    name: "{{ common_timezone }}"
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Apply all pending security updates
+  ansible.builtin.apt:
+    upgrade: safe
+    update_cache: true
+  when: common_apt_full_upgrade | bool
+
+- name: Install unattended-upgrades
+  ansible.builtin.apt:
+    name:
+      - unattended-upgrades
+      - apt-listchanges
+    state: present
+  when: common_install_unattended_upgrades | bool
+
+- name: Enable unattended-upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      // Managed by Ansible (role: common)
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+  when: common_install_unattended_upgrades | bool
+
+- name: Configure kernel parameters
+  ansible.builtin.import_tasks: sysctl.yml
+  tags: [sysctl]
+
+- name: Configure swap
+  ansible.builtin.import_tasks: swap.yml
+  tags: [swap]
+
+- name: Configure the firewall
+  ansible.builtin.import_tasks: firewall.yml
+  when: common_manage_firewall | bool
+  tags: [firewall]
+
+- name: Harden SSH
+  ansible.builtin.import_tasks: ssh.yml
+  tags: [ssh]

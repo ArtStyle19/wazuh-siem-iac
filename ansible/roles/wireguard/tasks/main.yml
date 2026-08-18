@@ -1,0 +1,62 @@
+---
+- name: Validate this host's overlay identity
+  # Checked first and loudly. An empty wireguard_address produces a config file that
+  # loads without error and carries no traffic — the worst kind of failure, because
+  # everything downstream reports success.
+  ansible.builtin.assert:
+    that:
+      - wireguard_role in ['hub', 'spoke']
+      - wireguard_address | length > 0
+      # Regex rather than ansible.utils.ipaddr: that filter would add a collection
+      # dependency to requirements.yml for one validation.
+      - wireguard_address is match('^(\d{1,3}\.){3}\d{1,3}$')
+    fail_msg: >-
+      {{ inventory_hostname }} has an invalid overlay identity:
+      role={{ wireguard_role | default('unset') }}
+      address={{ wireguard_address | default('unset') }}
+
+      Every mesh member needs a unique wireguard_address inside
+      {{ wireguard_subnet }}, and exactly one host must have wireguard_role=hub.
+      See ansible/examples/vps.example.
+    quiet: true
+
+- name: Install WireGuard on Debian family
+  ansible.builtin.import_tasks: debian.yml
+  when: ansible_os_family == 'Debian'
+
+- name: Install WireGuard on RedHat family
+  ansible.builtin.import_tasks: redhat.yml
+  when: ansible_os_family == 'RedHat'
+
+- name: Generate this host's keypair
+  ansible.builtin.import_tasks: keys.yml
+
+- name: Write the interface configuration
+  ansible.builtin.import_tasks: config.yml
+
+# Before the interface comes up, so the port is already open when the first peer dials.
+# Opening it afterwards leaves a window in which handshakes are dropped, and a dropped
+# handshake looks identical to an unreachable peer.
+- name: Open the overlay port on hosts that accept handshakes
+  ansible.builtin.import_tasks: firewall.yml
+  when: wireguard_listen | bool
+
+- name: Bring the interface up
+  ansible.builtin.systemd_service:
+    name: "wg-quick@{{ wireguard_interface }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+# Handlers reload the config in place; flush them here so verification below tests
+# the configuration this run produced rather than the one from the previous run.
+- name: Apply any pending configuration reload
+  ansible.builtin.meta: flush_handlers
+
+# After the flush, so it sees the interface as the handler left it — and catches the
+# case where a previous run's syncconf cleared the key and nothing has changed since.
+- name: Ensure the interface holds this host's key
+  ansible.builtin.import_tasks: identity.yml
+
+- name: Verify the tunnel actually carries traffic
+  ansible.builtin.import_tasks: verify.yml

@@ -1,0 +1,18 @@
+---
+# `yara` is not in baseos or appstream on RHEL 9 / Rocky / Alma: it lives in EPEL. Same
+# gap as `wireguard-tools` — see roles/wireguard/tasks/redhat.yml. Without this the
+# failure is `No match for argument: yara`, which reads like a typo rather than a missing
+# repository.
+#
+# `ansible_os_family` is 'RedHat' for the whole family, so branching on the family is not
+# enough: on Fedora the package IS in the main repository.
+- name: Enable EPEL for YARA
+  ansible.builtin.dnf:
+    name: epel-release
+    state: present
+  when: ansible_distribution != 'Fedora'
+
+- name: Install YARA
+  ansible.builtin.dnf:
+    name: yara
+    state: present

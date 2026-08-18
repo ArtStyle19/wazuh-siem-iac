@@ -1,0 +1,101 @@
+---
+# =============================================================================
+# WireGuard overlay — a private network for agents that cannot reach the manager
+# =============================================================================
+# The problem: Wazuh agents connect OUTBOUND to the manager, so a host that has no
+# route to the manager has nothing to connect to. That is the situation for a VPS on
+# the internet (manager behind a home router) and equally for a VM on a different
+# libvirt network.
+#
+# WireGuard gives both ends an address on a private subnet that exists only inside
+# the tunnel. Pointing the agent at the manager's tunnel address makes the overlay
+# provably load-bearing: if the tunnel is down, there is nothing to fall back to.
+#
+# Why plain WireGuard rather than Tailscale/Headscale: no third-party account, no
+# auth key to obtain, no SaaS in the trust path of a security tool — and the concepts
+# (keys, peers, AllowedIPs) are the ones Tailscale is built on, so they transfer.
+# =============================================================================
+
+wireguard_interface: wg0
+wireguard_port: 51820
+wireguard_dir: /etc/wireguard
+
+# Overlay subnet. Chosen to avoid this project's other networks:
+#   192.168.140.0/24  the libvirt lab network
+#   172.17-19.0.0/16  Docker's bridges on the manager
+# An overlay that collides with a container bridge is a genuine production outage,
+# and the symptom (some traffic works, some vanishes) is miserable to diagnose.
+wireguard_subnet: 10.88.0.0/24
+wireguard_prefix: 24
+
+# ---- Per-host identity: set these in inventory or group_vars ----------------
+
+# hub   = the Wazuh manager. One per deployment.
+# spoke = an agent host.
+wireguard_role: spoke
+
+# This host's address inside the tunnel, e.g. 10.88.0.2. Required, and asserted in
+# tasks/main.yml — an unset address would produce a config that loads and silently
+# carries nothing.
+wireguard_address: ""
+
+# Whether this host accepts incoming handshakes. A peer can only be dialled if it
+# both listens AND publishes a reachable endpoint.
+wireguard_listen: "{{ wireguard_role == 'hub' }}"
+
+# host:port that OTHER hosts should dial to reach this one. Empty means "not
+# dialable" — that peer must initiate instead. This single pair of variables is what
+# lets the same role serve both topologies:
+#
+#   manager listens (default, and what a datacenter deployment looks like):
+#     hub:   wireguard_endpoint = "<manager ip or dns>:51820"
+#     spoke: wireguard_endpoint = ""
+#
+#   manager dials out (for a manager behind NAT with no port forwarding):
+#     hub:   wireguard_endpoint = ""
+#     spoke: wireguard_endpoint = "<vps public ip>:51820", wireguard_listen = true
+wireguard_endpoint: ""
+
+# ---- Per-spoke override of the hub's endpoint --------------------------------
+#
+#   wireguard_hub_endpoint
+#
+# DELIBERATELY NOT DEFINED HERE. Only documented.
+#
+# The template tests `is defined`, so giving it a default would make every spoke look
+# like it had been overridden — and a default of "" would make every spoke passive,
+# breaking the ordinary case entirely. (Role defaults are the lowest precedence, so an
+# inventory value would still win the *value* — but not the `is defined` test. This is
+# the same trap that silently discarded wireguard_hub_endpoint_host earlier in this
+# project, where a group_vars definition outranked the inventory override.)
+#
+# Set it per host, in inventory:
+#
+#   unset            dial the hub at its published endpoint       (normal)
+#   ""               do not dial; stay passive and be dialled     (remote spoke behind
+#                                                                  a manager with no
+#                                                                  public endpoint)
+#   host:port        dial this instead of the hub's published one  (e.g. a DDNS name
+#                                                                  when the hub's own
+#                                                                  address is private)
+
+# Sent to any peer we have an Endpoint for. This is what holds a NAT mapping open so
+# the far side can reach back through it; without it, a tunnel established from
+# behind NAT goes quiet as soon as the mapping expires.
+wireguard_persistent_keepalive: 25
+
+# 1500 minus WireGuard's ~80 bytes of overhead.
+#
+# Set explicitly because the wrong MTU does not fail cleanly. Small packets pass, so
+# the handshake and pings succeed, while anything large (a TLS handshake, an agent
+# pushing a batch of events) stalls. "It connects but no data arrives" is almost
+# always this.
+wireguard_mtu: 1420
+
+# Group whose members form the mesh. The role reads peers from this group's hostvars,
+# so adding an agent is an inventory entry and nothing more.
+wireguard_mesh_group: wireguard_mesh
+
+# Seconds. A handshake older than this means the tunnel is not actually up, whatever
+# `systemctl status` claims.
+wireguard_handshake_max_age: 180

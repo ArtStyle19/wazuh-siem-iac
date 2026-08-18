@@ -1,0 +1,100 @@
+---
+# Request validation before any change, so an impossible combination of variables costs
+# a failed assert instead of a half-configured host.
+- name: Validate the request
+  ansible.builtin.include_tasks: validate.yml
+
+- name: Install the packages Ansible depends on
+  ansible.builtin.package:
+    name: "{{ bootstrap_packages }}"
+    state: present
+
+- name: Create the automation account
+  ansible.builtin.user:
+    name: "{{ bootstrap_user }}"
+    shell: /bin/bash
+    create_home: true
+    # No password hash is set at all, so there is no password to guess and no
+    # interactive login. `password: '!'` locks it explicitly rather than leaving the
+    # field empty, which some PAM configurations treat as "no password required".
+    password: "!"
+    # Not added to `sudo`/`wheel`: the grant is the sudoers file below, which is
+    # explicit, greppable and revocable by deleting one file. Group membership is
+    # invisible in a diff.
+    state: present
+  register: bootstrap_account
+
+- name: Authorise the SSH key
+  ansible.posix.authorized_key:
+    user: "{{ bootstrap_user }}"
+    key: "{{ bootstrap_ssh_public_key }}"
+    state: present
+    # Do not wipe other keys — another operator's access is not ours to remove.
+    exclusive: false
+    manage_dir: true
+    # Stated explicitly so `--check` works on a host where the account does not exist
+    # yet. Left implicit, the module resolves ~{{ bootstrap_user }} through getpwnam and
+    # aborts with "Either user must exist or you must provide full path to key file",
+    # because in check mode the task above only SIMULATED creating the user. That made a
+    # dry run impossible on precisely the hosts this role is for — brand new ones, where
+    # rehearsing before touching a real machine matters most.
+    #
+    # `.home` is what the user module actually created, so a distro that puts homes
+    # somewhere other than /home is still correct. It is ABSENT in check mode for a user
+    # that did not really get created, hence the fallback — which is only ever reached in
+    # check mode, where nothing is written and the path serves only the diff.
+    path: >-
+      {{ bootstrap_account.home | default('/home/' ~ bootstrap_user, true) }}/.ssh/authorized_keys
+
+- name: Grant passwordless sudo
+  ansible.builtin.copy:
+    dest: "{{ bootstrap_sudoers_file }}"
+    owner: root
+    group: root
+    # 0440 is required: sudo refuses to read a sudoers file that is group- or
+    # world-writable, and fails closed — you discover it the next time you need root.
+    mode: "0440"
+    content: |
+      # Managed by Ansible (role: bootstrap).
+      # Automation account for the wazuh-siem-iac playbooks. Revoke by deleting this
+      # file; the account itself has no password and cannot log in interactively.
+      {{ bootstrap_user }} ALL=(ALL) NOPASSWD:ALL
+    # Validate BEFORE the file is in place. A malformed sudoers file breaks sudo for
+    # everyone on the host, including the person trying to fix it — this is the one
+    # place where validate-on-write is not optional.
+    validate: /usr/sbin/visudo --check --file=%s
+  when: bootstrap_sudo_nopasswd | bool
+
+- name: Verify the automation account can escalate without a password
+  # Proves the outcome rather than trusting the tasks. Runs as the new account with
+  # its own sudo, so a broken sudoers file surfaces here instead of on the next
+  # playbook run.
+  ansible.builtin.command:
+    cmd: "sudo -n -u root id -un"
+  become: true
+  become_user: "{{ bootstrap_user }}"
+  register: bootstrap_sudo_check
+  changed_when: false
+  failed_when: bootstrap_sudo_check.stdout | trim != 'root'
+  # Skipped in check mode, and not because the check is inconvenient: there is nothing
+  # to verify when nothing was changed. `become_user` needs the account to really exist,
+  # so on a fresh host this dies with `sudo: unknown user` — reporting a failure caused
+  # by the dry run itself. Note `check_mode: false` would NOT help: forcing the command
+  # to run for real hits the same missing account.
+  when: not ansible_check_mode
+
+- name: Report how to reach this host from now on
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} bootstrapped.
+      Connect as {{ bootstrap_user }} with key auth and passwordless sudo —
+      set `ansible_user={{ bootstrap_user }}` for this host and drop
+      --ask-pass/--ask-become-pass.
+
+# Deliberately LAST. The new account is created, proven able to reach root, and only
+# then is the old one taken away — so a failure anywhere above leaves the host still
+# reachable by its existing credentials instead of by none.
+- name: Retire superseded automation accounts
+  ansible.builtin.include_tasks: revoke.yml
+  when: bootstrap_revoke_users | length > 0
+  tags: [revoke]

@@ -1,0 +1,87 @@
+; =============================================================================
+; Static inventory for hosts Terraform did not create
+; =============================================================================
+;     make vps-inventory        # copies this file to ansible/inventory/vps
+;
+; inventory/vps is GITIGNORED, and has no .ini extension on purpose: a directory
+; inventory silently skips .ini files — see ansible/ansible.cfg.
+;
+; This repository is public. The addresses, hostnames and usernames of machines you
+; actually run are exactly the reconnaissance you should not publish, so the real file
+; stays local. Ansible merges every file in inventory/, so this sits alongside the
+; Terraform-generated `hosts` without either touching the other.
+; =============================================================================
+
+
+; -----------------------------------------------------------------------------
+; Agents with NO route to the manager — a VPS, or a VM on another network
+; -----------------------------------------------------------------------------
+; Three separate addresses are in play here and conflating them is the main way this
+; goes wrong:
+;
+;   ansible_host          how ANSIBLE reaches the host, to configure it
+;   wireguard_address     the host's address INSIDE the tunnel (you assign it)
+;   wazuh_manager_address where the AGENT sends events — the hub's tunnel address,
+;                         set for you in group_vars/wazuh_agents_tunnel.yml
+;
+; The underlay (whatever routable path carries the encrypted packets) never appears
+; here at all. WireGuard only needs the hub's endpoint, which comes from the manager's
+; group_vars.
+[wazuh_agents_tunnel]
+; vps-01       ansible_host=203.0.113.10    ansible_user=wazuh-ansible  wireguard_address=10.88.0.2
+; lab-vm-01  ansible_host=192.168.140.51   ansible_user=wazuh-ansible  wireguard_address=10.88.0.3
+
+; Assign each host a unique address in 10.88.0.0/24. .1 is the hub.
+
+
+; -----------------------------------------------------------------------------
+; Agents on the same network as the manager — no overlay needed
+; -----------------------------------------------------------------------------
+[wazuh_agents_lan]
+; lab-vm-02  ansible_host=192.168.140.50  ansible_user=wazuh-ansible
+
+
+; -----------------------------------------------------------------------------
+; Parent group, so `make agent HOSTS=wazuh_agents` reaches everything
+; -----------------------------------------------------------------------------
+[wazuh_agents:children]
+wazuh_agents_tunnel
+wazuh_agents_lan
+
+
+; -----------------------------------------------------------------------------
+; The WireGuard mesh: the hub plus every spoke
+; -----------------------------------------------------------------------------
+; REQUIRED whenever you have tunnel agents. The overlay's key exchange needs every
+; member in one play — each host publishes its public key as a fact and reads its
+; peers' keys from hostvars — so they must share a group.
+[wireguard_mesh:children]
+wazuh_servers
+wazuh_agents_tunnel
+
+
+; -----------------------------------------------------------------------------
+; Hosts that still need their automation account created
+; -----------------------------------------------------------------------------
+; `make bootstrap HOSTS=bootstrap_targets` creates the `wazuh-ansible` account with
+; key auth and passwordless sudo, then remove the host from here. Connect for that one
+; run as whatever account already exists:
+;
+;     make bootstrap HOSTS=bootstrap_targets BOOTSTRAP_USER=debian ASK_PASS=1
+;
+; ASK_PASS=1 if your key is not installed for that user yet. If it already has
+; passwordless sudo (re-bootstrapping, or renaming the automation account), add
+; NO_BECOME_PASS=1 instead of being prompted for a password that does not exist.
+;
+; RETIRING AN OLD AUTOMATION ACCOUNT. Renaming the account leaves the previous one
+; behind, still key-authorised and still NOPASSWD root. Name it per host and the next
+; bootstrap run removes it, along with its sudoers drop-in:
+;
+;     somehost ansible_host=... ansible_user=wazuh-ansible bootstrap_revoke_users='["admin"]'
+;
+; Connect as the REPLACEMENT to do it — the role refuses to revoke the account it is
+; logged in as. Home directories are kept unless you also set
+; bootstrap_revoke_remove_home=true.
+;
+[bootstrap_targets]
+; lab-vm-01  ansible_host=192.168.140.51

@@ -1,0 +1,35 @@
+---
+# =============================================================================
+# Reject impossible requests before changing anything
+# =============================================================================
+# Runs first, so an operator error costs a failed assert rather than a half-configured
+# host. The checks here are about the request itself, not about the host's state.
+# =============================================================================
+
+- name: Refuse to revoke an account this run depends on
+  # Two names must never appear in the revoke list:
+  #
+  #   bootstrap_user  — the account being created. Revoking it would undo the bootstrap
+  #                     and leave the host with no automation account at all.
+  #   ansible_user    — the account this play is CONNECTED as. Revoking it cuts the
+  #                     branch we are standing on: sudo disappears mid-run and every
+  #                     later task fails with a permission error that looks nothing
+  #                     like its cause. Worse, the failure is only visible on the NEXT
+  #                     run, by which point the host is unreachable.
+  #
+  # Asserted rather than silently filtered. A revoke list naming the current user means
+  # the operator believes something false about this host; quietly performing three of
+  # four requested removals would hide that instead of surfacing it.
+  ansible.builtin.assert:
+    that:
+      - bootstrap_user not in bootstrap_revoke_users
+      - ansible_user not in bootstrap_revoke_users
+    fail_msg: >-
+      bootstrap_revoke_users on {{ inventory_hostname }} names an account this run
+      depends on: it may not contain the account being created ({{ bootstrap_user }})
+      or the account this play connects as ({{ ansible_user }}).
+
+      Retire a superseded account by connecting as its REPLACEMENT:
+        make bootstrap HOSTS={{ inventory_hostname }} BOOTSTRAP_USER={{ bootstrap_user }} NO_BECOME_PASS=1
+    quiet: true
+  when: bootstrap_revoke_users | length > 0

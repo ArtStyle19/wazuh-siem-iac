@@ -1,0 +1,65 @@
+---
+# =============================================================================
+# TLS certificate bundle
+# =============================================================================
+# Every internal hop in this stack is TLS: filebeat -> indexer, dashboard ->
+# indexer, dashboard -> manager API, and the browser -> dashboard. They are
+# signed by a private CA created here by Wazuh's own generator container.
+#
+# The certificates name the *container* hostnames (wazuh.indexer, wazuh.manager,
+# wazuh.dashboard), not the VM's address. That is why this bundle is identical
+# whether the stack runs locally or on a VPS — and also why your browser will
+# warn about the dashboard's certificate. Fixing the browser warning means
+# terminating TLS with a real certificate in front of the dashboard, which is a
+# VPS concern, not a lab one.
+#
+# The generator sets ownership itself: 1000:1000 for the indexer and dashboard
+# certificates, 999:999 for the manager's. Do not "fix" these permissions
+# afterwards — the containers run as those UIDs and will fail to read files you
+# have chowned to root.
+# =============================================================================
+
+- name: Check whether the certificate bundle already exists
+  ansible.builtin.stat:
+    path: "{{ wazuh_certs_dir }}/root-ca.pem"
+  register: wazuh_root_ca
+
+- name: Generate the certificate bundle
+  when: not wazuh_root_ca.stat.exists
+  block:
+    - name: Create the certificate directory
+      ansible.builtin.file:
+        path: "{{ wazuh_certs_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Run Wazuh's certificate generator
+      community.docker.docker_compose_v2_run:
+        project_src: "{{ wazuh_install_dir }}"
+        project_name: "{{ wazuh_compose_project }}-certs"
+        files:
+          - generate-certs.yaml
+        service: generator
+        cleanup: true
+        remove_orphans: true
+
+    - name: Confirm the expected certificates were produced
+      ansible.builtin.stat:
+        path: "{{ wazuh_certs_dir }}/{{ item }}"
+      register: wazuh_cert_check
+      failed_when: not wazuh_cert_check.stat.exists
+      loop:
+        - root-ca.pem
+        - root-ca-manager.pem
+        - admin.pem
+        - admin-key.pem
+        - wazuh.indexer.pem
+        - wazuh.indexer-key.pem
+        - wazuh.manager.pem
+        - wazuh.manager-key.pem
+        - wazuh.dashboard.pem
+        - wazuh.dashboard-key.pem
+      loop_control:
+        label: "{{ item }}"

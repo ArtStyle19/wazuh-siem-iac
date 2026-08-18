@@ -1,0 +1,39 @@
+---
+# =============================================================================
+# MANAGED BY ANSIBLE (role: wazuh_stack) — contains password hashes.
+# =============================================================================
+# Read by the indexer exactly once, while it initialises its security index
+# (plugins.security.allow_default_init_securityindex: true). After that the
+# index is authoritative and edits here have no effect until securityadmin.sh
+# pushes them — see tasks/rotate.yml.
+#
+# Two differences from the file upstream ships:
+#
+#   1. The hashes are of passwords from your Ansible Vault, not of the demo
+#      passwords published in Wazuh's public repository.
+#
+#   2. The demo accounts (kibanaro, logstash, readall, snapshotrestore) are
+#      gone. They are not used by this deployment, they exist with documented
+#      passwords, and every one of them is a login that does not need to exist.
+#      Removing unused internal users is safe: roles and role mappings live in
+#      separate files and reference role names, not these accounts.
+# =============================================================================
+
+_meta:
+  type: "internalusers"
+  config_version: 2
+
+# Full cluster administrator. This is the account you log into the dashboard as.
+{{ wazuh_indexer_username }}:
+  hash: "{{ wazuh_user_hashes[wazuh_indexer_username] }}"
+  reserved: true
+  backend_roles:
+    - "admin"
+  description: "Wazuh indexer administrator (managed by Ansible)"
+
+# Service account the dashboard itself uses to talk to the indexer. Not a login
+# for humans — it is passed to the dashboard container as DASHBOARD_PASSWORD.
+{{ wazuh_dashboard_username }}:
+  hash: "{{ wazuh_user_hashes[wazuh_dashboard_username] }}"
+  reserved: true
+  description: "Wazuh dashboard service account (managed by Ansible)"

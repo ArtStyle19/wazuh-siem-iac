@@ -1,0 +1,63 @@
+---
+# Covers the Fedora workstation this lab runs on, which is the most convenient
+# first agent: it is already reachable from the VM's NAT network and it is the
+# machine you actually care about monitoring.
+
+- name: Install Wazuh's repository signing key
+  ansible.builtin.rpm_key:
+    key: "{{ wazuh_gpg_key_url }}"
+    state: present
+
+- name: Configure the Wazuh yum repository
+  ansible.builtin.yum_repository:
+    name: wazuh
+    description: Wazuh repository
+    baseurl: "{{ wazuh_yum_repo_url }}"
+    gpgcheck: true
+    gpgkey: "{{ wazuh_gpg_key_url }}"
+    enabled: true
+    # `protect: true` removed — Ansible warns it "has no effect with dnf as an
+    # underlying package manager" and it is slated for removal in 2.22.
+
+- name: Install the Wazuh agent
+  ansible.builtin.dnf:
+    name: "wazuh-agent-{{ wazuh_agent_version }}"
+    state: present
+    # Ignore dnf's exclude list for this transaction only.
+    #
+    # Belt and braces: the task below removes the global exclude an earlier version
+    # of this role used to write, but a host may still carry one from elsewhere — and
+    # an operator's own `exclude=` is not something this role should have to fight or
+    # rewrite. We asked for an exact version by name; honour that.
+    disable_excludes: all
+  environment:
+    WAZUH_MANAGER: "{{ wazuh_manager_address }}"
+    WAZUH_AGENT_NAME: "{{ wazuh_agent_name }}"
+    WAZUH_AGENT_GROUP: "{{ wazuh_agent_group }}"
+    WAZUH_REGISTRATION_SERVER: "{{ wazuh_manager_address }}"
+  notify: Restart wazuh-agent
+
+- name: Remove the global dnf exclude written by earlier versions of this role
+  # This role used to add `exclude=wazuh-agent` to /etc/dnf/dnf.conf, intending the
+  # RHEL equivalent of Debian's `apt-mark hold`. It was wrong twice over:
+  #
+  #   1. It BREAKS THIS ROLE. dnf refuses to install an excluded package, so the
+  #      second run of the role fails with
+  #        "Argument 'wazuh-agent-4.14.7' matches only excluded packages."
+  #      The role installed the package, then made itself unable to install it —
+  #      not idempotent, and the failure looks like a repository problem.
+  #
+  #   2. `exclude` in dnf.conf [main] is a SHARED, GLOBAL setting, and a lineinfile
+  #      keyed on `^exclude=` overwrites whatever the operator already had there.
+  #      Silently editing someone else's exclude list is not ours to do.
+  #
+  # The version is pinned where pinning belongs: the explicit version in the install
+  # task above. If you want a real package-scoped hold on RHEL-family systems, the
+  # correct tool is the versionlock plugin (`dnf versionlock add wazuh-agent`), which
+  # is deliberately not installed here rather than faked with a global exclude.
+  #
+  # Only the exact line this role wrote is removed — any other exclude is left alone.
+  ansible.builtin.lineinfile:
+    path: /etc/dnf/dnf.conf
+    regexp: '^exclude=wazuh-agent\s*$'
+    state: absent

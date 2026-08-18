@@ -1,0 +1,61 @@
+<!--
+  MANAGED BY ANSIBLE (role: wazuh_stack). Do not edit on the manager.
+
+  Source: roles/wazuh_stack/templates/local_decoder.xml.j2
+  Deployed to /var/ossec/etc/decoders/local_decoder.xml
+
+  Decodes what the active response script `yara.sh` writes into the agent's
+  /var/ossec/logs/active-responses.log. Format produced:
+
+      wazuh-yara: INFO - Scan result: <RuleName> <path>
+      wazuh-yara: INFO - Skipped <path>: <reason>
+
+  It does NOT collide with the factory `ar_log` decoder: that one requires a date prefix and
+  the string `/active-response/bin/` in its prematch, neither of which these lines have.
+  Checked against /var/ossec/ruleset/decoders/0010-active-response_decoders.xml before
+  settling on this format.
+-->
+
+<decoder name="wazuh-yara">
+  <prematch>wazuh-yara: </prematch>
+</decoder>
+
+<!--
+  `type="pcre2"` rather than Wazuh's own OS_Regex syntax: the path can contain any character,
+  and with pcre2 that is expressed as `(.+)$` without ambiguity. Verified this version
+  supports it — the factory API and Palo Alto decoders already use it.
+
+  The rule name is captured with `(\S+)` and the path with `(.+)$`, in that order, because
+  the script prints the path last precisely so a filename containing spaces does not break
+  the parsing.
+-->
+<decoder name="wazuh-yara-scan-result">
+  <parent>wazuh-yara</parent>
+  <!--
+    ANCHORED with `^INFO - Scan result:` and offset after_parent, not a loose
+    `Scan result:`. The process scan line starts with `INFO - Memory scan result:`, which
+    CONTAINS the substring `Scan result:` — unanchored, this decoder would capture the memory
+    lines too and the level 12 rule would swallow the level 13 ones.
+  -->
+  <regex type="pcre2" offset="after_parent">^INFO - Scan result: (\S+) (.+)$</regex>
+  <order>yara_rule, yara_file</order>
+</decoder>
+
+<decoder name="wazuh-yara-skipped">
+  <parent>wazuh-yara</parent>
+  <regex type="pcre2" offset="after_parent">^INFO - Skipped (.+?): (.+)$</regex>
+  <order>yara_file, yara_skip_reason</order>
+</decoder>
+
+<!--
+  Running process scan. A different format from the disk one on purpose: a LIVE process
+  matching a malware signature is more serious than a dormant file, so it earns its own rule
+  and its own level. See local_rules.xml.j2, rule 110004.
+
+      wazuh-yara: INFO - Memory scan result: <rule> <real path> [pid <n>]
+-->
+<decoder name="wazuh-yara-memory">
+  <parent>wazuh-yara</parent>
+  <regex type="pcre2" offset="after_parent">^INFO - Memory scan result: (\S+) (.+?) \[pid ([0-9?]+)\]</regex>
+  <order>yara_rule, yara_process, yara_pid</order>
+</decoder>

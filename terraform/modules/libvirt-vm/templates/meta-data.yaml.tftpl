@@ -1,0 +1,7 @@
+# Rendered by Terraform.
+#
+# instance-id is what cloud-init uses to decide whether it has already run on
+# this machine. Keeping it stable means a reboot does not re-run the bootstrap;
+# changing it forces a full re-run on next boot.
+instance-id: ${instance_id}
+local-hostname: ${hostname}

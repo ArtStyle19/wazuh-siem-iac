@@ -1,0 +1,17 @@
+---
+# =============================================================================
+# Agents on the same network as the manager
+# =============================================================================
+# These reach the manager directly at its libvirt address, so they need no overlay —
+# one fewer moving part between agent and manager. `make agent-local` targets this
+# workstation without needing an entry here.
+# =============================================================================
+
+# Read from the manager's inventory entry rather than hard-coded, so changing
+# network_host_index in Terraform cannot silently strand these agents.
+wazuh_manager_address: >-
+  {{ hostvars[groups['wazuh_servers'] | first]['wazuh_manager_address'] }}
+
+wazuh_agent_needs_tunnel: false
+
+wazuh_agent_group: default

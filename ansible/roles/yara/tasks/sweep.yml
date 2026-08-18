@@ -1,0 +1,42 @@
+---
+# =============================================================================
+# On-demand sweep — invoked from ansible/yara-scan.yml
+# =============================================================================
+# Run through `import_role: {name: yara, tasks_from: sweep}` rather than as a standalone
+# playbook, because that is what makes Ansible load the role's defaults. A playbook that
+# only calls the script fails with 'yara_sweep_script' is undefined: a role's defaults
+# exist only when the role is imported.
+# =============================================================================
+
+- name: Require YARA to be installed on this host
+  ansible.builtin.stat:
+    path: "{{ yara_sweep_script }}"
+  register: yara_sweep_present
+
+- name: Fail with a useful message when YARA is absent
+  ansible.builtin.assert:
+    that:
+      - yara_sweep_present.stat.exists
+    fail_msg: >-
+      YARA is not installed on {{ inventory_hostname }}. Enable it with
+      `yara_enabled=true` in the inventory and run
+      `make agent HOSTS={{ inventory_hostname }}`.
+    quiet: true
+
+- name: Run the sweep
+  # `async` + `poll: 0`: a recursive sweep can take minutes and holding SSH open for all of
+  # it adds nothing. The findings arrive through Wazuh's own pipeline —
+  # the sweep log -> decoder -> rule 110001 -> dashboard — not through Ansible's output.
+  ansible.builtin.command:
+    cmd: "{{ yara_sweep_script }} {{ yara_scan_target_paths | default('') }}"
+  async: 3600
+  poll: 0
+  changed_when: true
+
+- name: Report where to look
+  ansible.builtin.debug:
+    msg: >-
+      Sweep launched on {{ inventory_hostname }}
+      ({{ yara_scan_target_paths | default('default paths') }}).
+      Findings appear as rule 110001 alerts (level 12) in the dashboard, and on the host in
+      {{ yara_sweep_log }}

@@ -1,0 +1,108 @@
+---
+# =============================================================================
+# Keys are generated ON the host and the private half never leaves it
+# =============================================================================
+# Most WireGuard roles do one of two things: generate keypairs on the control node
+# and distribute them, or generate on the host and read the private key back to
+# template it into wg0.conf. Both put the private key in Ansible's memory, in its
+# logs if anyone forgets `no_log`, and in a rendered config file.
+#
+# Here `wg genkey` runs on the host, the private key is written 0600 root and is
+# never read by Ansible. Only the PUBLIC key is read back, and only public keys are
+# exchanged between hosts — which is the whole point of asymmetric keys.
+#
+# The config therefore contains no secret, needs no `no_log`, and can be read during
+# debugging without exposing anything. The private key reaches the interface via
+# `PostUp = wg set %i private-key <file>` — see templates/wg0.conf.j2.
+# =============================================================================
+
+- name: Create the WireGuard configuration directory
+  ansible.builtin.file:
+    path: "{{ wireguard_dir }}"
+    state: directory
+    owner: root
+    group: root
+    # 0700: the directory holds a private key. wg-quick runs as root and needs
+    # nothing more permissive.
+    mode: "0700"
+
+- name: Generate the private key
+  # Generated and written in ONE step, redirected straight to the file. The key
+  # therefore never enters Ansible's memory, its stdout, or its logs — there is
+  # nothing here that `no_log` would need to hide.
+  #
+  # `umask 077` closes the window where the file could exist world-readable, rather
+  # than creating it and fixing the mode afterwards.
+  #
+  # `creates:` does double duty: it makes the task idempotent, and it prevents
+  # regeneration — a new key would silently invalidate every peer relationship,
+  # because the peers still hold the old public key.
+  ansible.builtin.shell:
+    cmd: "umask 077 && wg genkey > {{ wireguard_dir }}/{{ wireguard_interface }}.key"
+    creates: "{{ wireguard_dir }}/{{ wireguard_interface }}.key"
+
+- name: Enforce the private key's ownership and mode
+  # Declared rather than inherited from the umask above, so the state is asserted on
+  # every run and a hand-edited permission gets corrected.
+  ansible.builtin.file:
+    path: "{{ wireguard_dir }}/{{ wireguard_interface }}.key"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Check whether this host already has a private key
+  # Needed only to keep `--check` honest. In check mode the generate task above is
+  # skipped, so on a host that has never had a key there is nothing to derive a public
+  # key from — and no way to know what it WILL be. That case has to be reported, not
+  # asserted against.
+  ansible.builtin.stat:
+    path: "{{ wireguard_dir }}/{{ wireguard_interface }}.key"
+  register: wireguard_key_file
+
+- name: Read this host's public key
+  # `wg pubkey < keyfile` — the private key goes in on stdin from a file the guest
+  # already holds, so it never appears in argv (where `ps` could see it) and never
+  # reaches the control node.
+  ansible.builtin.shell:
+    cmd: "set -o pipefail && wg pubkey < {{ wireguard_dir }}/{{ wireguard_interface }}.key"
+    executable: /bin/bash
+  register: wireguard_pubkey_result
+  changed_when: false
+  # Runs under `--check` too. Deriving a PUBLIC key from a file changes nothing, and
+  # every decision below depends on it: skipped, the peer lists come out empty and the
+  # assert below fails with "got 0 characters" — a failure invented by the dry run
+  # rather than found by it. Same shape as the check-mode faults in roles/bootstrap.
+  check_mode: false
+  when: wireguard_key_file.stat.exists
+
+- name: Report that the key would be generated
+  # Only reachable under `--check` on a host with no key. Left UNDEFINED rather than
+  # faked: config.yml selects peers on `wireguard_public_key` being defined, so this
+  # host simply drops out of other hosts' peer lists instead of appearing with a
+  # placeholder key that would render a misleading diff.
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} has no WireGuard key yet; a real run would generate one
+      at {{ wireguard_dir }}/{{ wireguard_interface }}.key. Its public key cannot be
+      known in check mode, so this host is omitted from the peer lists below.
+  when: not wireguard_key_file.stat.exists
+
+- name: Record the public key as a fact
+  # Other hosts read this out of hostvars when building their peer lists. Public keys
+  # are not secret; that is the point of publishing it here.
+  ansible.builtin.set_fact:
+    wireguard_public_key: "{{ wireguard_pubkey_result.stdout | trim }}"
+  when: wireguard_key_file.stat.exists
+
+- name: Confirm the public key looks like a WireGuard key
+  # 32 bytes, base64 — 44 characters ending in '='. Catches a truncated or empty read
+  # before it becomes a peer entry that silently never handshakes.
+  ansible.builtin.assert:
+    that:
+      - wireguard_public_key | length == 44
+      - wireguard_public_key is match('^[A-Za-z0-9+/]{43}=$')
+    fail_msg: >-
+      Did not get a valid WireGuard public key from {{ inventory_hostname }}:
+      got {{ wireguard_public_key | length }} characters.
+    quiet: true
+  when: wireguard_key_file.stat.exists

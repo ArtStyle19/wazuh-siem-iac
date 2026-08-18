@@ -1,0 +1,70 @@
+{#
+  MANAGED BY ANSIBLE (role: wireguard) — do not edit on the host.
+  Edit roles/wireguard/templates/wg0.conf.j2 and re-run `make tunnel`.
+
+  This file deliberately contains NO PRIVATE KEY. See the PostUp line below.
+#}
+# {{ inventory_hostname }} — {{ wireguard_role }} at {{ wireguard_address }}
+# Managed by Ansible (role: wireguard). Local edits will be overwritten.
+#
+# Peers are generated from the '{{ wireguard_mesh_group }}' inventory group, so adding
+# an agent means adding one inventory entry, not editing this file on two hosts.
+
+[Interface]
+Address = {{ wireguard_address }}/{{ wireguard_prefix }}
+{% if wireguard_listen | bool %}
+ListenPort = {{ wireguard_port }}
+{% endif %}
+MTU = {{ wireguard_mtu }}
+
+# The private key is supplied here rather than inlined as PrivateKey, so that it
+# never appears in a templated file, in Ansible's memory, or in its logs. It was
+# generated on this host by `wg genkey` and has never left it.
+PostUp = wg set %i private-key {{ wireguard_dir }}/{{ wireguard_interface }}.key
+
+{% for peer in wireguard_peers %}
+# {{ peer.inventory_hostname }} ({{ peer.wireguard_role }})
+[Peer]
+PublicKey = {{ peer.wireguard_public_key }}
+{#
+  A single /32, never 0.0.0.0/0.
+
+  AllowedIPs is both a routing table and an access-control list in WireGuard: it
+  decides what this peer is allowed to send us and what we route to it. Narrowing it
+  to one address means a compromised spoke cannot impersonate another host, and — the
+  operational half — it guarantees we are not silently routing this server's whole
+  default route through the tunnel.
+#}
+AllowedIPs = {{ peer.wireguard_address }}/32
+{#
+  Which address THIS host uses to dial this peer — which is not simply the peer's own
+  published endpoint, because the hub can publish only one and different spokes may
+  need different answers.
+
+  A spoke may override the hub's endpoint via `wireguard_hub_endpoint`:
+
+    unset        use the hub's published endpoint (the normal case)
+    set to ""    do not dial at all — stay passive and wait to be dialled
+    set to a value  dial that instead (e.g. a DDNS name, where the hub's own
+                    published address is a private one this spoke cannot reach)
+
+  This is what lets one mesh mix directions: a local spoke dials the hub at a private
+  address, while a remote spoke sits passive and the hub dials out to IT. WireGuard
+  allows that because ListenPort is per-interface but Endpoint is per-peer.
+#}
+{% set peer_endpoint = wireguard_hub_endpoint
+     if (wireguard_role == 'spoke'
+         and peer.wireguard_role == 'hub'
+         and wireguard_hub_endpoint is defined)
+     else peer.wireguard_endpoint | default('') %}
+{% if peer_endpoint | length > 0 %}
+Endpoint = {{ peer_endpoint }}
+{#
+  Only sent to peers we actually dial. Holds the NAT mapping open so the far side can
+  reach back through it; without it a tunnel raised from behind NAT goes silent when
+  the mapping expires, and the agent appears to "randomly" disconnect.
+#}
+PersistentKeepalive = {{ wireguard_persistent_keepalive }}
+{% endif %}
+
+{% endfor %}

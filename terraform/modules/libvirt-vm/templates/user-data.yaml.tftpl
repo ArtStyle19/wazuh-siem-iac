@@ -1,0 +1,64 @@
+#cloud-config
+# ---------------------------------------------------------------------------
+# Rendered by Terraform — do not edit the generated ISO, edit the template.
+#
+# Scope: make this VM reachable by SSH and manageable by Ansible. Nothing more.
+# The workload is installed by Ansible so that changing it does not require
+# rebuilding the VM.
+# ---------------------------------------------------------------------------
+
+hostname: ${hostname}
+fqdn: ${fqdn}
+prefer_fqdn_over_hostname: false
+manage_etc_hosts: true
+preserve_hostname: false
+
+timezone: ${timezone}
+
+users:
+  - name: ${admin_username}
+    groups: [sudo]
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+# Key-only access. There is no password to brute-force and no root login.
+ssh_pwauth: false
+disable_root: true
+
+package_update: true
+# Left off on purpose: a full upgrade here can add several minutes to first
+# boot and races the Ansible run. `roles/common` handles patching.
+package_upgrade: false
+
+packages:
+%{ for pkg in packages ~}
+  - ${pkg}
+%{ endfor ~}
+
+# The cloud image ships a small root partition; grow it to fill the virtual disk.
+growpart:
+  mode: auto
+  devices: ["/"]
+  ignore_growroot_disabled: false
+resize_rootfs: true
+
+runcmd:
+  # Needs the virtio channel declared in the domain XML to be of any use.
+  - [systemctl, enable, --now, qemu-guest-agent]
+  - [systemctl, enable, --now, ssh]
+  - [apt-get, clean]
+
+write_files:
+  - path: /etc/cloud-init-bootstrap.json
+    permissions: "0644"
+    content: |
+      {
+        "provisioned_by": "terraform",
+        "hostname": "${fqdn}",
+        "admin_user": "${admin_username}"
+      }
+
+final_message: "cloud-init finished for ${fqdn} after $UPTIME seconds"

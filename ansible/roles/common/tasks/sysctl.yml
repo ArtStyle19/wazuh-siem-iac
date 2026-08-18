@@ -1,0 +1,55 @@
+---
+# =============================================================================
+# vm.max_map_count is not optional
+# =============================================================================
+# The Wazuh indexer is OpenSearch, which memory-maps every Lucene segment. The
+# Debian default of 65530 is far below what it needs, and the failure mode is
+# specific and confusing: the container starts, logs
+#
+#   max virtual memory areas vm.max_map_count [65530] is too low,
+#   increase to at least [262144]
+#
+# and exits. Because `restart: always` is set, Docker keeps restarting it, so
+# `docker compose ps` shows a container that is perpetually "Restarting" rather
+# than one that failed. Set on the VM, not in the container — it is a kernel
+# parameter and containers share the host kernel.
+# =============================================================================
+
+- name: Raise vm.max_map_count for the Wazuh indexer
+  ansible.posix.sysctl:
+    name: vm.max_map_count
+    value: "{{ common_max_map_count }}"
+    sysctl_file: /etc/sysctl.d/99-wazuh.conf
+    sysctl_set: true
+    reload: true
+    state: present
+
+- name: Set swappiness
+  ansible.posix.sysctl:
+    name: vm.swappiness
+    value: "{{ common_swappiness }}"
+    sysctl_file: /etc/sysctl.d/99-wazuh.conf
+    sysctl_set: true
+    reload: true
+    state: present
+
+- name: Raise the system-wide file descriptor limit
+  ansible.posix.sysctl:
+    name: fs.file-max
+    value: "{{ common_file_max }}"
+    sysctl_file: /etc/sysctl.d/99-wazuh.conf
+    sysctl_set: true
+    reload: true
+    state: present
+
+# The manager's compose service asks for nofile 655360. A container cannot be
+# granted a limit above the daemon's own hard limit, so raise it here too.
+- name: Raise nofile limits for all users
+  community.general.pam_limits:
+    domain: "*"
+    limit_type: "{{ item }}"
+    limit_item: nofile
+    value: "655360"
+  loop:
+    - soft
+    - hard

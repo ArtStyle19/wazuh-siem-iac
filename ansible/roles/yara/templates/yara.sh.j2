@@ -1,0 +1,159 @@
+#!/bin/sh
+# =============================================================================
+# MANAGED BY ANSIBLE (role: yara). Do not edit on the host.
+# =============================================================================
+# Wazuh active response script. wazuh-execd launches it ON THE AGENT when the manager
+# fires the rule configured in <active-response>, and it receives the whole alert as JSON
+# on standard input.
+#
+# THIS SCRIPT RUNS AS ROOT. It is a privileged execution path the manager can trigger on
+# any agent, so it does nothing but read a file and run yara: it does not delete, does not
+# kill processes and does not touch the network.
+#
+# Output: one line per match in active-responses.log, which the agent ships to the manager,
+# where the decoder and custom rule turn it into an alert.
+#   wazuh-yara: INFO - Scan result: <rule> <file>
+# =============================================================================
+
+# Explicit PATH. wazuh-execd exports a reasonable one, but that is not guaranteed across
+# installation variants, and an active response script that depends on the inherited
+# environment fails in the worst possible way: silently. Verified that with `env -i` this
+# script exited rc=0 having written nothing.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+RULES_INDEX="{{ yara_dir }}/index.yar"
+LOG="/var/ossec/logs/active-responses.log"
+LOCK="{{ yara_lock_file }}"
+MAX_KB="{{ yara_max_file_size_kb }}"
+TIMEOUT="{{ yara_scan_timeout }}"
+
+log() { printf '%s\n' "wazuh-yara: $1" >> "$LOG" 2>/dev/null; }
+
+# ---------------------------------------------------------------------------
+# Read and parse the alert
+# ---------------------------------------------------------------------------
+# python3 rather than jq: roles/bootstrap guarantees python3 on every managed host, jq is
+# installed on none of them. A real parser also avoids the classic of extracting paths with
+# grep and breaking on a filename that contains spaces.
+INPUT=$(cat)
+[ -n "$INPUT" ] || exit 0
+
+# The `|| ...` CANNOT be a bare `exit 0`, and this is the lesson from 2026-08-13: the first
+# version exited silently if python3 failed or was not on PATH, and from outside that was
+# indistinguishable from "no matches". An hour went into looking for the fault in Wazuh's
+# plumbing when the script was simply giving up without saying so.
+#
+# Now any parse failure leaves a trace in the log, which is the least something running as
+# root and unattended should do.
+PARSED=$(printf '%s' "$INPUT" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    sys.stderr.write(str(e))
+    sys.exit(1)
+sc = (d.get("parameters", {}).get("alert", {}) or {}).get("syscheck", {}) or {}
+print(d.get("command", ""))
+print(sc.get("path", ""))
+' 2>/dev/null) || {
+    log "ERROR - Could not parse the incoming alert (python3 available: $(command -v python3 || echo no))"
+    exit 0
+}
+
+COMMAND=$(printf '%s\n' "$PARSED" | sed -n 1p)
+FILE=$(printf '%s\n' "$PARSED" | sed -n 2p)
+
+# Wazuh sends `add` when firing and `delete` when the timeout expires. There is nothing to
+# revert here, so `delete` is ignored without noise.
+[ "$COMMAND" = "add" ] || exit 0
+
+# No path means nothing to scan: that happens when the rule that fired is not a FIM rule.
+[ -n "$FILE" ] || exit 0
+
+# ---------------------------------------------------------------------------
+# GUARD 1 — path allowlist. The most important one.
+# ---------------------------------------------------------------------------
+# Rule 554 fires for any new file in ANY path FIM monitors. Without this filter a
+# `git clone` under /home or a deploy into /var/www would launch hundreds of root scans.
+# It is checked before anything else because it is the most frequent case and the cheapest
+# to reject.
+#
+# It exits silently: logging every rejection would turn a burst of 900 FIM events into 900
+# lines shipped to the manager, which is the problem being avoided.
+IN_SCOPE=0
+for prefix in {{ yara_scan_paths | map('quote') | join(' ') }}; do
+    case "$FILE" in
+        "$prefix"/*) IN_SCOPE=1; break ;;
+    esac
+done
+[ "$IN_SCOPE" -eq 1 ] || exit 0
+
+# The file may already be gone: that is exactly what this malware does, create and delete
+# within a second. Not an error, just the expected race.
+[ -f "$FILE" ] || exit 0
+
+# ---------------------------------------------------------------------------
+# GUARD 2 — size ceiling
+# ---------------------------------------------------------------------------
+# Scanning a disk image or a database dump adds nothing and blocks everyone else's turn.
+# This rejection IS logged: the path was in scope, so knowing it was skipped is useful
+# information, and there are few such cases.
+SIZE_KB=$(du -k "$FILE" 2>/dev/null | cut -f1)
+if [ -n "$SIZE_KB" ] && [ "$SIZE_KB" -gt "$MAX_KB" ]; then
+    log "INFO - Skipped ${FILE}: ${SIZE_KB}KB exceeds ${MAX_KB}KB limit"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# GUARD 3 — mutual exclusion
+# ---------------------------------------------------------------------------
+# `flock -n` fails immediately rather than waiting. That is deliberate: in a burst the
+# overlapping scans should be DROPPED, not queued. Queuing them is what turns a burst into
+# an outage, because each one compiles 900 rules.
+mkdir -p "$(dirname "$LOCK")" 2>/dev/null
+
+exec 9>"$LOCK" 2>/dev/null || exit 0
+if ! flock -n 9 2>/dev/null; then
+    log "INFO - Skipped ${FILE}: another scan in progress"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Scan
+# ---------------------------------------------------------------------------
+if ! command -v yara >/dev/null 2>&1; then
+    log "ERROR - yara is not on PATH; cannot scan ${FILE}"
+    exit 0
+fi
+
+if [ ! -r "$RULES_INDEX" ]; then
+    log "ERROR - cannot read the rule index ${RULES_INDEX}"
+    exit 0
+fi
+
+# `timeout` bounds the worst case: a pathological rule against a large file can take a long
+# time, and this runs holding the lock.
+# `-w` silences warnings, which in a public set of 900 rules are constant and say nothing
+# useful here.
+MATCHES=$(timeout "$TIMEOUT" yara -w "$RULES_INDEX" "$FILE" 2>/dev/null)
+RC=$?
+
+if [ "$RC" -eq 124 ]; then
+    log "INFO - Scan timed out after ${TIMEOUT}s: ${FILE}"
+    exit 0
+fi
+
+[ -n "$MATCHES" ] || exit 0
+
+# yara prints one line per match: "RuleName /path/to/file". It is rewritten into the format
+# the manager's decoder expects, taking the path from the variable rather than from yara's
+# output, so a filename containing spaces does not break the parsing.
+printf '%s\n' "$MATCHES" | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    rule=$(printf '%s' "$line" | awk '{print $1}')
+    [ -n "$rule" ] || continue
+    log "INFO - Scan result: ${rule} ${FILE}"
+done
+
+exit 0

@@ -1,0 +1,54 @@
+---
+- name: Reload wireguard
+  # `wg syncconf`, not `systemctl restart wg-quick@wg0`.
+  #
+  # A restart runs `wg-quick down` then `up`: it destroys the interface, drops every
+  # peer's session and re-runs PostUp. On a hub with N agents, adding one agent would
+  # therefore interrupt all N — and every Wazuh agent would log a disconnect and
+  # re-handshake. `syncconf` applies the difference to the live interface instead,
+  # leaving established sessions alone.
+  #
+  # `wg-quick strip` renders the config without the wg-quick-only directives
+  # (Address, MTU, PostUp) that `wg syncconf` would reject. Process substitution needs
+  # bash, hence the explicit executable.
+  #
+  # Note what syncconf does NOT apply: changes to Address, MTU or PostUp are
+  # wg-quick's concern, not wg's. Those need a real restart, which is rare enough to
+  # be a deliberate act.
+  #
+  # ---------------------------------------------------------------------------
+  # THE `wg set private-key` AFTERWARDS IS LOAD-BEARING. DO NOT REMOVE IT.
+  # ---------------------------------------------------------------------------
+  # PostUp is one of the directives `wg-quick strip` removes — and PostUp is the ONLY
+  # place this role references its private key, because wg0.conf deliberately carries no
+  # `PrivateKey` line. The stripped config therefore describes a device with no private
+  # key, and `wg syncconf` faithfully applies exactly that: it CLEARS the running key.
+  #
+  # The breakage is silent and total. `systemctl is-active` still reports active, the
+  # interface keeps its address, and `wg show` still lists every peer along with the last
+  # handshake time and byte counters from before the wipe — but the device now has no
+  # identity, so no handshake can complete and every session is dead. It reads as a
+  # network fault rather than a local one.
+  #
+  # And it fires precisely when the mesh GROWS, because the hub's config only changes
+  # when a peer is added. The first scale-out of this role took down every agent already
+  # connected — the exact failure that choosing syncconf over `systemctl restart` was
+  # meant to prevent.
+  #
+  # Re-applying from the key FILE preserves the original property: the secret is passed
+  # as a path, never in argv, so it stays out of `ps` and out of Ansible.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      wg syncconf {{ wireguard_interface }} <(wg-quick strip {{ wireguard_interface }}) &&
+      wg set {{ wireguard_interface }}
+      private-key {{ wireguard_dir }}/{{ wireguard_interface }}.key
+    executable: /bin/bash
+  # A handler only runs because something changed, so reporting changed is correct —
+  # and satisfies ansible-lint's no-changed-when, which otherwise flags every shell
+  # task whose effect it cannot infer.
+  changed_when: true
+  # Only meaningful once the interface exists. On a first run the config is written
+  # before wg-quick@wg0 has ever started, and syncconf against a missing interface
+  # fails; starting the service in main.yml reads the new config anyway.
+  when: wireguard_interface in ansible_facts.interfaces | default([])

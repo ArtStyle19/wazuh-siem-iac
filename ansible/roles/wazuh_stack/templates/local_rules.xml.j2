@@ -1,0 +1,145 @@
+<!--
+  MANAGED BY ANSIBLE (role: wazuh_stack). Do not edit on the manager.
+
+  Source: roles/wazuh_stack/templates/local_rules.xml.j2
+  Deployed to /var/ossec/etc/rules/local_rules.xml
+
+  Range 110000-110099. Wazuh reserves 100000 and above for user rules; below that the IDs
+  belong to the factory ruleset and an upgrade would overwrite them.
+
+  A syntax error here stops wazuh-analysisd from starting, so `custom_rules.yml` validates
+  with `wazuh-analysisd -t` BEFORE restarting the manager.
+-->
+
+<!-- ==========================================================================
+     YARA matches
+     ========================================================================== -->
+<group name="yara,">
+
+  <!--
+    Container rule, level 0: raises no alert by itself. It exists so the rules below can hang
+    off it with `if_sid` instead of each repeating the `decoded_as`.
+  -->
+  <rule id="110000" level="0">
+    <decoded_as>wazuh-yara</decoded_as>
+    <description>YARA messages grouped.</description>
+  </rule>
+
+  <!--
+    THE ALERT THAT MATTERS. Level 12: a file on disk matches a malware signature.
+    In the 2026-08-12 incident this is what would have said "XorDDoS" instead of "file
+    added", and it would have saved the entire manual investigation.
+
+    The negative lookahead excludes the canary rule so chain tests do not show up as real
+    incidents. Without it, every verification would produce a level 12 alert
+    indistinguishable from a genuine finding, which is the fastest way to teach a team to
+    ignore level 12 alerts.
+  -->
+  <rule id="110001" level="12">
+    <if_sid>110000</if_sid>
+    <!--
+      `yara_file` is what separates a DISK finding from a memory one: the process decoder
+      sets `yara_process`, not `yara_file`. Without this condition this rule would also match
+      the memory lines and 110004 (level 13) would never fire.
+    -->
+    <field name="yara_file" type="pcre2">.+</field>
+    <field name="yara_rule" type="pcre2">^(?!WAZUH_Canary_).+</field>
+    <description>YARA: $(yara_rule) matched on $(yara_file)</description>
+    <mitre>
+      <id>T1204.002</id>
+    </mitre>
+    <group>malware,yara_match,gdpr_IV_35.7.d,</group>
+  </rule>
+
+  <!--
+    The canary rule, deliberately at level 5. It confirms the whole chain works — FIM, active
+    response, YARA, decoder, rule — without faking an incident.
+  -->
+  <rule id="110002" level="5">
+    <if_sid>110000</if_sid>
+    <field name="yara_file" type="pcre2">.+</field>
+    <field name="yara_rule" type="pcre2">^WAZUH_Canary_</field>
+    <description>YARA: chain self-test passed ($(yara_file)) — not malware</description>
+    <group>yara_selftest,</group>
+  </rule>
+
+  <!--
+    RUNNING MALWARE. Level 13, above the disk finding (12), and the difference is not
+    cosmetic: a file on disk can be an inert leftover of an already contained infection, but
+    a live process matching a signature is acting right now.
+
+    It is also the only path that detects this family's technique: create the binary, run it
+    and delete it within a second. Nothing is left on disk; in /proc/<pid>/exe there is.
+  -->
+  <rule id="110004" level="13">
+    <if_sid>110000</if_sid>
+    <field name="yara_process" type="pcre2">.+</field>
+    <description>YARA: RUNNING process matches $(yara_rule) — $(yara_process) pid $(yara_pid)</description>
+    <mitre>
+      <id>T1620</id>
+    </mitre>
+    <group>malware,yara_match,process_injection,</group>
+  </rule>
+
+  <!--
+    Skipped scans. Level 3 because they are not a finding, but they are the only signal that
+    a guard is discarding work: if this shows up constantly, either the size ceiling is
+    miscalibrated or there is a burst of events worth investigating.
+  -->
+  <rule id="110003" level="3">
+    <if_sid>110000</if_sid>
+    <field name="yara_skip_reason" type="pcre2">.+</field>
+    <description>YARA: scan skipped on $(yara_file) — $(yara_skip_reason)</description>
+    <group>yara_skipped,</group>
+  </rule>
+
+</group>
+
+<!-- ==========================================================================
+     Behaviour: mass binary creation in system paths
+     ========================================================================== -->
+<group name="syscheck,malware_behaviour,">
+
+  <!--
+    This rule exists because of one concrete finding: the malware on the compromised host
+    created and deleted
+    a randomly named binary in /usr/bin every five seconds. Wazuh recorded it faithfully —
+    910 events — but each one as an independent level 5 or 7 alert. Nobody reviews 910 level 5
+    alerts; the pattern was only obvious once aggregated.
+
+    A composite rule turns that noise into an alert somebody does look at. `if_matched_sid`
+    with `frequency` counts how many times 554 (file added) fired within `timeframe`, and
+    `field` restricts the count to system binary paths.
+
+    The thresholds are a starting point, not a truth: a package manager during a large
+    upgrade also creates many files in /usr/bin. That is why `ignore` prevents it looping,
+    and why it is worth tuning after watching a full `apt upgrade`. A false positive during
+    an upgrade is acceptable; missing the real pattern is not.
+  -->
+  <rule id="110010" level="12" frequency="8" timeframe="120" ignore="600">
+    <if_matched_sid>554</if_matched_sid>
+    <field name="file" type="pcre2">^/(usr/)?(local/)?s?bin/</field>
+    <description>Multiple new binaries in system paths in a short window — possible self-replicating malware</description>
+    <mitre>
+      <id>T1036.005</id>
+    </mitre>
+    <group>malware,</group>
+  </rule>
+
+  <!--
+    Persistence. The paths where the malware's autostart lived: /lib/libudev.so (an
+    executable disguised as a library) and /etc/init.d with S90 links. FIM watched neither
+    of them, so both were found by hand. Now it watches them — see agent.conf.j2 — and this
+    rule lifts any change there above the noise.
+  -->
+  <rule id="110011" level="10">
+    <if_sid>550,553,554</if_sid>
+    <field name="file" type="pcre2">^/(usr/)?lib/[^/]+\.so|^/etc/(init\.d|rc[0-9S]\.d)/</field>
+    <description>Change in a system persistence path: $(file)</description>
+    <mitre>
+      <id>T1543.002</id>
+    </mitre>
+    <group>malware,persistence,</group>
+  </rule>
+
+</group>

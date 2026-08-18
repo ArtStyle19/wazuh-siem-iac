@@ -1,0 +1,67 @@
+---
+- name: Validate the YARA configuration
+  # Before installing anything. An empty path list would mean the script never scans, and
+  # that looks exactly like "no malware found".
+  ansible.builtin.assert:
+    that:
+      - yara_scan_paths | length > 0
+      - yara_rules_commit | length == 40
+      - yara_max_file_size_kb | int > 0
+    fail_msg: >-
+      Invalid YARA configuration on {{ inventory_hostname }}:
+      yara_scan_paths has {{ yara_scan_paths | length }} entries (needs at least 1),
+      and yara_rules_commit must be a 40-character SHA
+      (it is "{{ yara_rules_commit | default('') }}").
+    quiet: true
+
+- name: Install YARA on Debian family
+  ansible.builtin.import_tasks: debian.yml
+  when: ansible_os_family == 'Debian'
+
+- name: Install YARA on RedHat family
+  ansible.builtin.import_tasks: redhat.yml
+  when: ansible_os_family == 'RedHat'
+
+- name: Deploy the rule set
+  ansible.builtin.import_tasks: rules.yml
+
+- name: Install the active response script
+  ansible.builtin.template:
+    src: yara.sh.j2
+    dest: "{{ yara_active_response_script }}"
+    owner: root
+    # The `wazuh` group needs read access: wazuh-execd runs as root, but the
+    # active-response tree belongs to group wazuh in the package installation.
+    group: wazuh
+    mode: "0750"
+
+- name: Install the on-demand sweep script
+  ansible.builtin.template:
+    src: yara-scan.sh.j2
+    dest: "{{ yara_sweep_script }}"
+    owner: root
+    group: wazuh
+    mode: "0750"
+
+- name: Create the sweep log with permissions logcollector can read
+  # Group `wazuh` and 0660: logcollector runs as that user. Created root:root 0600 the
+  # sweep would write correctly and the agent could not read it — another silent failure
+  # of the "it works but nobody sees the result" family.
+  ansible.builtin.file:
+    path: "{{ yara_sweep_log }}"
+    state: touch
+    owner: root
+    group: wazuh
+    mode: "0660"
+    modification_time: preserve
+    access_time: preserve
+  register: yara_sweep_log_created
+  # If the file did NOT exist, logcollector already started without it, exhausted its open
+  # attempts and will not follow it: the sweep would write and nobody would see the
+  # results. Verified in practice — logcollector logged `Could not open file ... No such file
+  # or directory` one minute before the role created the file, and matches were lost
+  # silently.
+  notify: Restart wazuh agent to pick up the sweep log
+
+- name: Verify YARA works and the rules load
+  ansible.builtin.import_tasks: verify.yml

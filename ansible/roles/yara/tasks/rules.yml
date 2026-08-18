@@ -1,0 +1,166 @@
+---
+# =============================================================================
+# The rule set is fetched ONCE on the control node, not once per agent
+# =============================================================================
+# Three reasons, all of which matter:
+#   - every agent gets identical rules; downloading per agent would give different
+#     versions depending on the day the playbook ran
+#   - only the control node needs outbound internet, so this works on agents with no
+#     access to GitHub
+#   - the pin is verifiable in one place
+#
+# `become: false` on the delegated tasks: the play runs with become, and without this
+# Ansible would try to sudo on the control node to write into the user's own cache.
+# =============================================================================
+
+- name: Check the cached rule set revision
+  ansible.builtin.command:
+    cmd: git rev-parse HEAD
+    chdir: "{{ yara_rules_cache | expanduser }}"
+  register: yara_cache_head
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Fetch the pinned rule set
+  # Sparse clone: the full repository is large and a normal clone takes minutes, but with
+  # --sparse limited to yara/rules it is ~7 MB and 5 seconds.
+  #
+  # The `git` module is not used because it does not support sparse-checkout, and without
+  # that this task is impractical. The price is handling idempotence by hand, which is what
+  # the task above does by comparing HEAD with the pinned commit.
+  #
+  # A literal block `|`, not a folded `>-`: inside a folded scalar a line with MORE
+  # indentation keeps its newline instead of joining the previous one. With `>-` this
+  # command broke right after `--sparse` and git failed with rc=129 for missing arguments —
+  # invisible when reading the YAML, only visible in the command output.
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      dest={{ yara_rules_cache | expanduser | quote }}
+      rm -rf "$dest"
+      mkdir -p "$(dirname "$dest")"
+      git clone --quiet --depth 1 --filter=blob:none --sparse {{ yara_rules_repo | quote }} "$dest"
+      cd "$dest"
+      git sparse-checkout set yara/rules
+      git fetch --quiet --depth 1 origin {{ yara_rules_commit | quote }}
+      git checkout --quiet {{ yara_rules_commit | quote }}
+    executable: /bin/bash
+  when: yara_cache_head.stdout | default('') | trim != yara_rules_commit
+  changed_when: true
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Confirm the cache is at the pinned commit
+  # Checks the outcome instead of trusting the previous task. A checkout that half-failed
+  # would pass rules from another version off as the pinned ones.
+  ansible.builtin.command:
+    cmd: git rev-parse HEAD
+    chdir: "{{ yara_rules_cache | expanduser }}"
+  register: yara_cache_head_after
+  changed_when: false
+  check_mode: false
+  failed_when: yara_cache_head_after.stdout | trim != yara_rules_commit
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Assemble the Linux rules into a single file
+  # One file instead of 248. Copying 248 files would be 248 tasks and a very slow run;
+  # concatenating is valid here because the Linux subset was verified to have no duplicate
+  # rule identifiers and no module imports.
+  #
+  # `regexp` is what drops the Windows rules: they carry `import "pe"`, which compiles on a
+  # Linux agent but contributes nothing and makes the file ten times larger.
+  ansible.builtin.assemble:
+    src: "{{ yara_rules_cache | expanduser }}/yara/rules"
+    dest: "{{ yara_rules_cache | expanduser }}/linux-rules.yar"
+    regexp: "{{ yara_rules_glob | regex_replace('\\*', '.*') }}$"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Create the rule directories on the agent
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: wazuh
+    mode: "0750"
+  loop:
+    - "{{ yara_dir }}"
+    - "{{ yara_dir }}/rules"
+    - "{{ yara_local_rules_dir }}"
+
+- name: Deploy the public rule set
+  ansible.builtin.copy:
+    src: "{{ yara_rules_cache | expanduser }}/linux-rules.yar"
+    dest: "{{ yara_rules_file }}"
+    owner: root
+    group: wazuh
+    mode: "0640"
+  register: yara_public_rules
+
+- name: Deploy the local rule overlay
+  # Rules of our own, versioned in the repository. They live in a separate directory from
+  # the public set so that bumping the pin never deletes them.
+  ansible.builtin.copy:
+    src: rules.local/
+    dest: "{{ yara_local_rules_dir }}/"
+    owner: root
+    group: wazuh
+    mode: "0640"
+  register: yara_local_rules
+
+- name: Find the local rule files
+  ansible.builtin.find:
+    paths: "{{ yara_local_rules_dir }}"
+    patterns: "*.yar"
+  register: yara_local_found
+  changed_when: false
+
+- name: Build the rule index
+  # ONE index file including everything, because the scripts invoke yara once. Without it
+  # they would need one invocation per rule file, and each invocation recompiles the whole
+  # set — the cost that matters most here, since it happens on every FIM event that gets
+  # past the guards.
+  #
+  # YARA does not accept wildcards in `include`, so the paths are enumerated from `find`.
+  ansible.builtin.copy:
+    dest: "{{ yara_dir }}/index.yar"
+    owner: root
+    group: wazuh
+    mode: "0640"
+    content: |
+      /* Managed by Ansible (role: yara). Do not edit. */
+      include "{{ yara_rules_file }}"
+      {% for f in yara_local_found.files | map(attribute='path') | sort %}
+      include "{{ f }}"
+      {% endfor %}
+  register: yara_index
+
+- name: Record the rule set provenance
+  # These are third-party patterns applied with privilege. Writing down where they came
+  # from and at which version is part of being able to audit this later.
+  ansible.builtin.copy:
+    dest: "{{ yara_dir }}/PROVENANCE"
+    owner: root
+    group: wazuh
+    mode: "0640"
+    content: |
+      Managed by Ansible (role: yara). Do not edit by hand.
+
+      Public set : {{ yara_rules_repo }}
+      Commit     : {{ yara_rules_commit }}
+      Filter     : {{ yara_rules_glob }}
+      File       : {{ yara_rules_file }}
+      Own rules  : {{ yara_local_rules_dir }}/
+
+      The commit is a content hash, so git verifies the integrity of the checkout by
+      itself. To change version: update yara_rules_commit in
+      roles/yara/defaults/main.yml and re-run.

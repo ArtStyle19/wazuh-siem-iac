@@ -1,0 +1,72 @@
+---
+# Base packages for day-to-day operation and debugging. cloud-init installs the
+# bare minimum needed to reach the host; this is the rest.
+common_packages:
+  - vim
+  - git
+  - jq
+  - unzip
+  - htop
+  - rsync
+  - dnsutils
+  - iproute2
+  - iputils-ping
+  - lsof
+  - tcpdump
+  - ncat
+
+common_timezone: "{{ host_timezone | default('Etc/UTC') }}"
+
+# ---- Memory -----------------------------------------------------------------
+common_swapfile_path: /swapfile
+common_swapfile_size_mb: 2048
+# Low but non-zero: prefer RAM, but allow the kernel to page out genuinely cold
+# pages rather than invoking the OOM killer on the indexer.
+common_swappiness: 10
+
+# ---- Kernel tuning required by the Wazuh indexer ----------------------------
+# OpenSearch memory-maps its Lucene indices and will refuse to start if this is
+# below 262144. This is the single most common cause of a "wazuh.indexer keeps
+# restarting" report.
+common_max_map_count: 262144
+common_file_max: 65536
+
+# ---- Firewall ---------------------------------------------------------------
+common_manage_firewall: true
+common_manage_docker_firewall: true
+
+# Sources permitted to reach the Wazuh agent ports through the DOCKER-USER chain.
+# Everything else is dropped — see tasks/docker_firewall.yml.
+#
+# BOTH entries are load-bearing, and omitting the second is a mistake this project
+# actually made: restricting the ports to the overlay alone silently disconnected the
+# LAN agent running on the hypervisor, which connects from the lab network rather than
+# through the tunnel. `wazuh_agents_lan` is a supported group, so the firewall has to
+# reflect that it exists.
+#
+# The lab network is derived from the manager's own primary interface rather than
+# hard-coded or plumbed through from Terraform: "the network this manager is on" is
+# precisely the set of addresses a LAN agent can have, and it stays correct if the
+# subnet is ever changed.
+#
+# Set to just the overlay for a deployment where every agent is remote — that is the
+# stricter and, on a public VPS, the correct choice.
+common_wazuh_agent_allowed_sources:
+  - "{{ wireguard_subnet | default('10.88.0.0/24') }}"
+  - "{{ ansible_default_ipv4.network }}/{{ ansible_default_ipv4.prefix }}"
+
+# Ports opened for the Wazuh stack. See the caveat in tasks/firewall.yml about
+# what ufw does and does not protect once Docker is involved.
+common_firewall_rules:
+  - { port: 22, proto: tcp, comment: "SSH" }
+  - { port: 443, proto: tcp, comment: "Wazuh dashboard" }
+  - { port: 1514, proto: tcp, comment: "Wazuh agent communication" }
+  - { port: 1515, proto: tcp, comment: "Wazuh agent enrollment" }
+  - { port: 514, proto: udp, comment: "Syslog ingestion" }
+  - { port: 55000, proto: tcp, comment: "Wazuh server API" }
+
+# ---- Patching ---------------------------------------------------------------
+common_install_unattended_upgrades: true
+# Deliberately off. A full apt upgrade mid-deploy is slow and can restart
+# services underneath the containers. Patching is unattended-upgrades' job.
+common_apt_full_upgrade: false

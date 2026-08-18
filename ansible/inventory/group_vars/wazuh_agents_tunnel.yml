@@ -1,0 +1,38 @@
+---
+# =============================================================================
+# Agents that reach the manager through the WireGuard overlay
+# =============================================================================
+# For a host with no route to the manager — a VPS on the internet, or a VM on a
+# different network. The distinction this group encodes: how *Ansible* reaches the
+# host (its own address, in inventory/vps) is a different question from how the
+# *Wazuh agent* reaches the manager (the overlay address below).
+# =============================================================================
+
+wireguard_role: spoke
+
+# Spokes do not listen. They dial the hub, and PersistentKeepalive keeps the return
+# path open — which is what lets an agent behind NAT be reached by the manager's
+# replies without any inbound firewall rule.
+wireguard_listen: false
+wireguard_endpoint: ""
+
+# ---------------------------------------------------------------------------
+# THIS is what makes the test honest
+# ---------------------------------------------------------------------------
+# The agent is pointed at the hub's *tunnel* address, which exists nowhere except
+# inside WireGuard. No firewall rule is needed to prove the overlay carries the
+# traffic: if the tunnel is down there is no route to this address at all, and the
+# agent goes Disconnected.
+#
+# Read from the hub's own hostvars rather than hard-coded, so changing
+# wireguard_address on the manager cannot silently strand every agent.
+wazuh_manager_address: >-
+  {{ hostvars[groups['wazuh_servers'] | first]['wireguard_address'] }}
+
+# These hosts need the overlay before the agent has anything to talk to.
+wazuh_agent_needs_tunnel: true
+
+# Internet-facing policy: FIM with report_changes on /var/www, cron directories,
+# /etc/systemd/system, ~/.ssh and /home, plus SCA and rootcheck. See
+# roles/wazuh_stack/templates/agent.conf.j2 — the manager pushes this to the group.
+wazuh_agent_group: vps

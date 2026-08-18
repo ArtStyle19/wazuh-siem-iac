@@ -1,0 +1,74 @@
+---
+# =============================================================================
+# bootstrap — day-0 provisioning for a host Terraform did not create
+# =============================================================================
+# The VM the lab creates gets its automation account from cloud-init. A pre-existing
+# machine — someone's VPS, or a VM that predates this project — does not. This role is
+# that missing step, and every managed fleet has one: before configuration
+# management can run unattended, something has to create the account it runs as.
+#
+# Run ONCE per host, with credentials you already have:
+#
+#   make bootstrap HOSTS=<pattern>      (prompts for SSH + sudo password)
+#
+# Afterwards the host is reachable as `wazuh-ansible` with key auth and passwordless
+# sudo, so the rest of the playbooks treat every managed host the same way.
+#
+# NOTE the name is not `wazuh`: the wazuh-agent package creates its own `wazuh` user
+# (uid 113) and group, which this would collide with. It is not `admin` either, because
+# a generic name says nothing about who owns the account or why it exists — on a shared
+# machine that is the difference between an account someone can attribute and one they
+# are tempted to reuse.
+#
+# WHY A DEDICATED ACCOUNT rather than granting your own user NOPASSWD:
+#   - your human account keeps its password requirement, so an interactive mistake
+#     still asks before doing damage
+#   - the automation account is key-only with no password at all, so it cannot be
+#     brute-forced or used interactively
+#   - its sudo grant is one auditable file, easy to find and revoke
+#   - Wazuh alerts on changes to /etc/sudoers.d — this account's grant is visible in
+#     the FIM stream rather than buried in the group `sudo`
+# =============================================================================
+
+bootstrap_user: wazuh-ansible
+
+# The key authorised for the automation account. Read from the control node, so
+# whoever runs the playbook grants their own access.
+bootstrap_ssh_public_key: "{{ lookup('ansible.builtin.file', bootstrap_ssh_public_key_path) }}"
+bootstrap_ssh_public_key_path: "~/.ssh/id_ed25519.pub"
+
+# Full NOPASSWD. This is the honest default for a fleet whose playbooks install
+# packages, write to /etc and manage services — a command allowlist that covers all of
+# that is a fiction that grants root by another route. Narrow it if a specific host
+# genuinely needs less.
+bootstrap_sudo_nopasswd: true
+bootstrap_sudoers_file: /etc/sudoers.d/90-{{ bootstrap_user }}
+
+# Packages Ansible itself needs. python3 for every module; sudo because a minimal
+# Debian install genuinely may not have it.
+bootstrap_packages:
+  - python3
+  - sudo
+
+# ---------------------------------------------------------------------------
+# Superseded automation accounts to retire
+# ---------------------------------------------------------------------------
+# Names of OLD automation accounts this role should remove, along with their sudoers
+# drop-ins. Empty by default — a role that deletes accounts it was not told about is
+# not one you can run unattended.
+#
+# This exists because renaming the automation account is only half a rename: the old
+# account keeps its authorised key and its NOPASSWD root on every host bootstrapped
+# before the change. Recording the retirement here rather than sshing in to run
+# `userdel` means hosts bootstrapped later are converged too, and the decision is
+# visible in the repo instead of in someone's shell history.
+#
+# Set it per-host or per-group in inventory, then re-run bootstrap CONNECTING AS THE
+# REPLACEMENT account (revoke.yml refuses to remove the account it is connected as):
+#
+#   make bootstrap HOSTS=<pattern> BOOTSTRAP_USER=wazuh-ansible NO_BECOME_PASS=1
+bootstrap_revoke_users: []
+
+# Whether to delete the retired accounts' home directories. Off by default: that step
+# is not reversible, and an old automation home may hold logs worth reading first.
+bootstrap_revoke_remove_home: false

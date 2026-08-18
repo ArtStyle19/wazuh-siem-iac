@@ -1,0 +1,44 @@
+---
+# =============================================================================
+# Converge the live interface onto this host's key
+# =============================================================================
+# The private key is installed by `PostUp` at interface start and re-applied by the
+# reload handler. Both are EVENTS — a service start, a config change. Neither runs on a
+# converged host, so if the live key is ever wrong or absent, no amount of re-running
+# the role fixes it: every task reports ok and the tunnel stays dead.
+#
+# That is not hypothetical. `wg syncconf` clears the private key when handed a config
+# without a `PrivateKey` line, which is what `wg-quick strip` produces here by design
+# (see handlers/main.yml). Once that happened, the role could detect the damage in
+# verify.yml but had no path to repair it, because the repair was attached to a change
+# that had already been made.
+#
+# So the key is treated as STATE, asserted every run, exactly like the file's mode in
+# keys.yml. Configuration management converges state; it does not merely react to
+# edits. The handler is still worth keeping — it applies the key at the moment of the
+# change rather than waiting for the next run.
+# =============================================================================
+
+- name: Read the key the interface is currently using
+  ansible.builtin.command:
+    cmd: "wg show {{ wireguard_interface }} public-key"
+  register: wireguard_live_pubkey
+  changed_when: false
+  check_mode: false
+  # A host whose interface does not exist yet is handled by the service start above;
+  # there is nothing to converge until it does.
+  when: wireguard_interface in ansible_facts.interfaces | default([])
+
+- name: Apply this host's private key to the interface
+  # Reads the secret from a path, so it never appears in argv where `ps` could see it —
+  # the same guarantee keys.yml and the PostUp directive rely on.
+  ansible.builtin.command:
+    cmd: >-
+      wg set {{ wireguard_interface }}
+      private-key {{ wireguard_dir }}/{{ wireguard_interface }}.key
+  when:
+    - wireguard_interface in ansible_facts.interfaces | default([])
+    - wireguard_live_pubkey.stdout | default('') | trim != wireguard_public_key
+  # Genuinely changes the device when it runs, and the `when` above means it only runs
+  # on a host whose live key is wrong — so a converged host reports nothing.
+  changed_when: true

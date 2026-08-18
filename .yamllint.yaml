@@ -1,0 +1,36 @@
+---
+# Tuned for Ansible. The defaults are written for hand-authored config files and
+# fight with how Ansible YAML is conventionally written.
+extends: default
+
+ignore: |
+  ansible/roles/*/templates/
+  .terraform/
+  ansible/inventory/group_vars/all/vault.yml
+
+rules:
+  # Task names and Jinja expressions are routinely long, and hard-wrapping a
+  # Jinja expression makes it less readable, not more.
+  line-length: disable
+
+  # `on:`/`yes:`/`no:` as bare words are a real YAML 1.1 hazard, but Ansible
+  # modules legitimately take truthy strings like "on" for logging.
+  truthy:
+    allowed-values: ["true", "false", "yes", "no", "on", "off"]
+    check-keys: false
+
+  comments:
+    min-spaces-from-content: 1
+
+  # Ansible convention is two-space indentation with sequences indented under
+  # their key.
+  indentation:
+    spaces: 2
+    indent-sequences: true
+
+  braces:
+    max-spaces-inside: 1
+
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: false

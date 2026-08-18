@@ -1,0 +1,67 @@
+---
+# =============================================================================
+# The Wazuh manager — WireGuard hub
+# =============================================================================
+# The manager is the hub of the overlay: every agent that cannot reach it directly
+# peers with it, and nothing peers with anything else.
+# =============================================================================
+
+wireguard_role: hub
+
+# The address agents are pointed at. It exists only inside the tunnel, which is what
+# makes the overlay provably load-bearing — see group_vars/wazuh_agents_tunnel.yml.
+wireguard_address: 10.88.0.1
+
+# Declared HERE and not left to the role default, even though
+# roles/wireguard/defaults computes the same value from wireguard_role.
+#
+# roles/common gates its ufw rule for 51820/udp on this variable, and site.yml applies
+# `common` WITHOUT applying `wireguard` — so the role default is out of scope during
+# `make configure`. Left undefined there, `| default(false)` silently skipped the rule
+# and the port was never opened on a freshly built manager, which would stop any local
+# spoke from dialling in. The existing rule survived only because an earlier version of
+# that gate had already added it, so nothing appeared to be wrong.
+#
+# Whether the manager accepts handshakes is a fact about the deployment, not an internal
+# of one role, so inventory is where it belongs.
+wireguard_listen: true
+
+# ---------------------------------------------------------------------------
+# The endpoint spokes dial — NOT necessarily this host's own address
+# ---------------------------------------------------------------------------
+# This distinction is the whole reason WireGuard is here, and conflating the two is
+# the easiest way to build a tunnel that cannot possibly connect.
+#
+#   In a datacenter, the manager is directly reachable, so its own address is right.
+#
+#   Behind NAT — a manager at home, or on a private hypervisor network — spokes
+#   cannot reach the manager at all. They dial the GATEWAY, which forwards one UDP
+#   port inward. In production that gateway is your router's public address; in this
+#   lab it is the hypervisor. Either way it is not the manager's address.
+#
+# Set `wireguard_hub_endpoint_host` in your local inventory (inventory/vps) for the
+# NAT case; the fallback below suits the directly-reachable case.
+#
+# NOTE THAT IT IS DELIBERATELY *NOT* DEFINED HERE, only defaulted at the point of use.
+#
+# Ansible variable precedence, lowest to highest, includes:
+#     3. inventory file group vars      ([wazuh_servers:vars] in an ini file)
+#     6. inventory group_vars/*         (this file)
+#
+# So a `wireguard_hub_endpoint_host: ...` line here would OUTRANK — and silently
+# discard — the override in inventory/vps. Leaving it undefined and supplying the
+# fallback with `| default()` means any definition anywhere wins, which is what
+# "overridable" has to mean.
+#
+# This was caught by inspecting the resolved value rather than assuming: the override
+# looked correct in the inventory file and had no effect at all.
+wireguard_endpoint: "{{ wireguard_hub_endpoint_host | default(ansible_host) }}:{{ wireguard_port | default(51820) }}"
+
+# ---------------------------------------------------------------------------
+# Inverting the tunnel instead
+# ---------------------------------------------------------------------------
+# If you cannot forward a port at all, clear the endpoint here and give each spoke
+# `wireguard_listen: true` plus its own `wireguard_endpoint`. The manager then dials
+# out to each agent and PersistentKeepalive holds the path open. Same role, same
+# template, no code change — but it scales worse, because every agent then needs a
+# reachable UDP port of its own.

@@ -1,0 +1,36 @@
+---
+# Docker CE from Docker's own repository rather than Debian's docker.io package.
+# The Wazuh compose file relies on Compose v2 syntax and the compose plugin,
+# which Debian does not package.
+docker_apt_repo_url: https://download.docker.com/linux/debian
+docker_apt_gpg_url: https://download.docker.com/linux/debian/gpg
+docker_apt_keyring: /etc/apt/keyrings/docker.asc
+
+# Resolved from the running host rather than hard-coded, so the same role works
+# on bookworm or a future forky.
+docker_apt_suite: "{{ ansible_distribution_release }}"
+docker_apt_component: stable
+
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# Users granted socket access. Membership in `docker` is root-equivalent — a
+# member can mount the host filesystem into a privileged container. Acceptable
+# for a single-operator lab; on a shared host, use sudo instead.
+docker_users:
+  - "{{ ansible_user | default('admin') }}"
+
+# Container log rotation. Without this, json-file logs grow without bound and
+# eventually fill the disk — which on this VM would take the indexer's data
+# volume with it.
+docker_daemon_options:
+  log-driver: json-file
+  log-opts:
+    max-size: 10m
+    max-file: "3"
+  storage-driver: overlay2
+  live-restore: true

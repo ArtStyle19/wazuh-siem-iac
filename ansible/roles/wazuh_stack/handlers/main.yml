@@ -1,0 +1,93 @@
+---
+# Every restart handler shares one condition, for the same reason. Handlers run at
+# the end of the play, after deploy.yml. Two cases to distinguish:
+#
+#   compose reported changed    -> containers were just created or recreated, so
+#                                  they already read the new config. Restarting
+#                                  again is pointless churn.
+#   compose reported no change  -> the stack was already running and only a mounted
+#                                  config changed. This is the case that genuinely
+#                                  needs a restart.
+
+- name: Restart wazuh manager
+  community.docker.docker_compose_v2:
+    project_src: "{{ wazuh_install_dir }}"
+    project_name: "{{ wazuh_compose_project }}"
+    files:
+      - compose.yaml
+    state: restarted
+    services:
+      - wazuh.manager
+  when:
+    - wazuh_compose_up is defined
+    - not wazuh_compose_up.changed
+
+- name: Recreate wazuh manager
+  # For changes to the MOUNTED ossec.conf. See the comment in config.yml: the entrypoint
+  # only copies /wazuh-config-mount when the container is created, so a restart applies
+  # nothing. Recreating is the only way the mounted file reaches /var/ossec/etc.
+  #
+  # No data is lost: all the manager's state lives in named volumes (wazuh_etc,
+  # wazuh_queue, wazuh_logs...), including the custom rules, which are in wazuh_etc and
+  # not in the mount.
+  #
+  # The real cost is that agents disconnect for a few seconds and come back on their own.
+  # That is acceptable because it only happens when the manager configuration really
+  # changes.
+  community.docker.docker_compose_v2:
+    project_src: "{{ wazuh_install_dir }}"
+    project_name: "{{ wazuh_compose_project }}"
+    files:
+      - compose.yaml
+    state: present
+    recreate: always
+    services:
+      - wazuh.manager
+  when:
+    - wazuh_compose_up is defined
+    - not wazuh_compose_up.changed
+
+- name: Restart wazuh indexer
+  # Notified when opensearch.yml changes. A config the indexer cannot read, or one
+  # it read at a previous start, both require a real restart — the JVM parses
+  # opensearch.yml exactly once, at boot.
+  community.docker.docker_compose_v2:
+    project_src: "{{ wazuh_install_dir }}"
+    project_name: "{{ wazuh_compose_project }}"
+    files:
+      - compose.yaml
+    state: restarted
+    services:
+      - wazuh.indexer
+  when:
+    - wazuh_compose_up is defined
+    - not wazuh_compose_up.changed
+
+- name: Restart wazuh dashboard
+  community.docker.docker_compose_v2:
+    project_src: "{{ wazuh_install_dir }}"
+    project_name: "{{ wazuh_compose_project }}"
+    files:
+      - compose.yaml
+    state: restarted
+    services:
+      - wazuh.dashboard
+  when:
+    - wazuh_compose_up is defined
+    - not wazuh_compose_up.changed
+
+- name: Reload wazuh agent groups
+  # The manager re-reads shared group configuration and recalculates the checksum
+  # agents compare against. Without this the new agent.conf sits on disk until the
+  # manager happens to restart.
+  #
+  # Not a container restart: `agent_groups -q` is a targeted reload, and bouncing
+  # the manager would disconnect every agent to publish a config change.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - wazuh.manager
+      - /var/ossec/bin/agent_groups
+      - -q
+  changed_when: true

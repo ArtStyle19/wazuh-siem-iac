@@ -1,0 +1,123 @@
+---
+# =============================================================================
+# Retire superseded automation accounts
+# =============================================================================
+# Renaming the automation account is not finished when the new one works. The old one
+# is still there, still key-authorised, still NOPASSWD root — a credential nobody is
+# watching, on every host bootstrapped before the rename. "It is only in the lab" is
+# how those survive to production.
+#
+# So the retirement is declarative, in the same role that created the account. Listing
+# a name in `bootstrap_revoke_users` is the record of the decision; running the play
+# converges every host to it, including hosts added later.
+#
+# Empty by default: a role that removes accounts it was not told about is a role you
+# cannot safely run.
+# =============================================================================
+
+
+# The safety gate for these tasks is `validate.yml`, run as the FIRST task of the role
+# rather than here. An impossible request — revoking the account we are connected as —
+# should be rejected before the role changes anything, not after.
+
+- name: Revoke sudo from superseded accounts
+  # Privilege first, account second. If anything interrupts this play, the state it
+  # leaves behind is an account that can no longer reach root — the safe direction.
+  #
+  # Both filenames are removed because this role's own naming changed: grants written
+  # before the rename are `90-ansible-<user>`, after it `90-<user>`. Cleaning only the
+  # current convention would leave the real grant in place and the account still root.
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ bootstrap_revoke_users
+       | product(['/etc/sudoers.d/90-', '/etc/sudoers.d/90-ansible-'])
+       | map('reverse') | map('join') | list }}
+
+# ---------------------------------------------------------------------------
+# Close out live sessions before deleting the account
+# ---------------------------------------------------------------------------
+# `userdel` refuses while the account owns a running process, and any account that has
+# ever been logged into over SSH owns one: systemd starts a `user@.service` manager,
+# which on a desktop image drags in pipewire, dbus and gvfsd. So on a real host this is
+# the normal case, not an edge case.
+#
+# `force: true` (userdel -f) would delete the account anyway — and leave those processes
+# running under a uid that no longer resolves. The next account created reuses that uid
+# and silently inherits them, along with anything they still hold open. Terminating the
+# session first is the difference between a retired account and a haunted one.
+
+- name: Stop superseded accounts from lingering
+  # Without this, systemd restarts the user manager the moment it is terminated, and the
+  # wait below never converges. Linger is what keeps a user manager alive with no
+  # session attached.
+  ansible.builtin.command:
+    cmd: "loginctl disable-linger {{ item }}"
+  loop: "{{ bootstrap_revoke_users }}"
+  register: bootstrap_revoke_linger
+  changed_when: bootstrap_revoke_linger.rc == 0
+  # Non-zero here means the account or its manager is already absent, which is the
+  # desired state — so this must not fail, or the second run breaks.
+  failed_when: false
+  when: ansible_service_mgr == 'systemd'
+
+- name: Terminate login sessions for superseded accounts
+  ansible.builtin.command:
+    cmd: "loginctl terminate-user {{ item }}"
+  loop: "{{ bootstrap_revoke_users }}"
+  register: bootstrap_revoke_terminate
+  changed_when: bootstrap_revoke_terminate.rc == 0
+  failed_when: false
+  when: ansible_service_mgr == 'systemd'
+
+- name: Wait for superseded accounts to own no processes
+  # Termination is asynchronous: loginctl returns as soon as it has signalled, while the
+  # user manager takes a moment to stop its children. Deleting the account in that
+  # window is the race this closes.
+  #
+  # `pgrep -u` exits non-zero both when nothing matches AND when the name does not
+  # resolve, so both "already clean" and "already deleted" report clear — which is what
+  # makes a re-run idempotent instead of a failure.
+  ansible.builtin.shell:
+    cmd: "pgrep -u {{ item | quote }} >/dev/null 2>&1 && echo busy || echo clear"
+    executable: /bin/bash
+  loop: "{{ bootstrap_revoke_users }}"
+  register: bootstrap_revoke_procs
+  until: bootstrap_revoke_procs.stdout | trim == 'clear'
+  retries: 10
+  delay: 2
+  changed_when: false
+
+- name: Remove superseded accounts
+  ansible.builtin.user:
+    name: "{{ item }}"
+    state: absent
+    # Home directories are kept unless explicitly asked for. Deleting one destroys
+    # anything left in it — logs, a half-finished script — and is not reversible, so it
+    # is not something this role should decide on its own.
+    remove: "{{ bootstrap_revoke_remove_home | bool }}"
+    # Deliberately NOT tied to `force`. The sessions are already gone by this point, so
+    # userdel has nothing to override; if it still refuses, something is holding the
+    # account open that this role does not understand, and failing loudly is correct.
+    force: false
+  loop: "{{ bootstrap_revoke_users }}"
+
+- name: Confirm the superseded accounts are gone and hold no sudo
+  # Checks the outcome from the host's own view rather than trusting the two tasks
+  # above. `getent passwd` returning nothing is the only real proof the account is
+  # absent; `sudo -ln -U` would still report a grant coming from a group or another
+  # drop-in file this role never wrote.
+  ansible.builtin.command:
+    cmd: "getent passwd {{ item }}"
+  loop: "{{ bootstrap_revoke_users }}"
+  register: bootstrap_revoke_check
+  changed_when: false
+  # getent exits 2 when the name does not exist, which is the success case here.
+  failed_when: bootstrap_revoke_check.rc == 0
+
+- name: Report what was retired
+  ansible.builtin.debug:
+    msg: >-
+      Retired on {{ inventory_hostname }}: {{ bootstrap_revoke_users | join(', ') }}
+      (home directories {{ 'deleted' if bootstrap_revoke_remove_home | bool else 'kept' }}).

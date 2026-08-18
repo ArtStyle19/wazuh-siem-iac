@@ -1,0 +1,84 @@
+---
+# Everything except internal_users.yml, which passwords.yml owns because its
+# contents depend on generated bcrypt hashes.
+#
+# OWNERSHIP IS NOT COSMETIC HERE. Files bind-mounted into a container must be owned
+# by the uid that container runs as — see the note in defaults/main.yml. Files read
+# only on the VM (the certs manifest, the generator's compose file) stay root-owned.
+
+- name: Template the certificate manifest
+  # Read by the generator container, which runs as root.
+  ansible.builtin.template:
+    src: certs.yml.j2
+    dest: "{{ wazuh_config_dir }}/certs.yml"
+    owner: root
+    group: root
+    mode: "0640"
+
+- name: Template the certificate generator compose file
+  # Read by the docker CLI on the VM, not by a container.
+  ansible.builtin.template:
+    src: generate-certs.yaml.j2
+    dest: "{{ wazuh_install_dir }}/generate-certs.yaml"
+    owner: root
+    group: root
+    mode: "0640"
+
+- name: Template the indexer configuration
+  ansible.builtin.template:
+    src: wazuh.indexer.yml.j2
+    dest: "{{ wazuh_config_dir }}/wazuh_indexer/wazuh.indexer.yml"
+    # Mounted as the indexer's opensearch.yml. Root-owned here means the indexer
+    # dies on startup with AccessDeniedException.
+    owner: "{{ wazuh_indexer_uid }}"
+    group: "{{ wazuh_indexer_gid }}"
+    mode: "0640"
+  notify: Restart wazuh indexer
+
+- name: Template the dashboard configuration
+  ansible.builtin.template:
+    src: opensearch_dashboards.yml.j2
+    dest: "{{ wazuh_config_dir }}/wazuh_dashboard/opensearch_dashboards.yml"
+    # Root-owned here means the dashboard dies with EACCES from Node.js.
+    owner: "{{ wazuh_dashboard_uid }}"
+    group: "{{ wazuh_dashboard_gid }}"
+    mode: "0640"
+  notify: Restart wazuh dashboard
+
+- name: Template the dashboard's Wazuh API connection
+  ansible.builtin.template:
+    src: wazuh.yml.j2
+    dest: "{{ wazuh_config_dir }}/wazuh_dashboard/wazuh.yml"
+    owner: "{{ wazuh_dashboard_uid }}"
+    group: "{{ wazuh_dashboard_gid }}"
+    # 0640 and not 0644: this file holds the API password in plaintext.
+    mode: "0640"
+  # Contains the API password.
+  no_log: true
+  notify: Restart wazuh dashboard
+
+- name: Template the manager configuration
+  ansible.builtin.template:
+    src: wazuh_manager.conf.j2
+    dest: "{{ wazuh_config_dir }}/wazuh_cluster/wazuh_manager.conf"
+    # Root, correctly: the manager's entrypoint reads this as root before dropping
+    # to uid 999. This is why the manager was the only container that survived the
+    # original ownership bug.
+    owner: root
+    group: root
+    mode: "0640"
+  # RECREATE and not restart, and that difference is what makes this file do anything at
+  # all.
+  #
+  # compose mounts it at /wazuh-config-mount/etc/ossec.conf, not at
+  # /var/ossec/etc/ossec.conf. The image's entrypoint copies from there to the real
+  # destination ONCE, when the container is created. A `docker compose restart` re-runs the
+  # process but does NOT copy again: the mount holds the new content and the manager keeps
+  # using the old one.
+  #
+  # Verified 2026-08-13: after changing the template and restarting,
+  #   grep -c yara_scan /wazuh-config-mount/etc/ossec.conf  -> 2
+  #   grep -c yara_scan /var/ossec/etc/ossec.conf           -> 0
+  # The playbook reported `changed` and the change was nowhere. It had gone unnoticed
+  # because until then this template had never been modified against a running stack.
+  notify: Recreate wazuh manager

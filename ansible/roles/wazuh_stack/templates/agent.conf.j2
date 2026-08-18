@@ -1,0 +1,199 @@
+<!--
+  MANAGED BY ANSIBLE (role: wazuh_stack) — group: {{ wazuh_group_name }}
+
+  Shared configuration pushed to every agent in this group. Edit
+  roles/wazuh_stack/templates/agent.conf.j2 and re-run `make configure`; do not
+  edit it on the manager, and do not configure agents individually.
+
+  Agents pick changes up on their next sync (within ~10 minutes) without a restart.
+-->
+<agent_config>
+
+  <!--
+    Agent queue headroom. The default is too small as soon as a host produces bursts — a
+    package upgrade, a deploy, or malware creating files — and when the queue fills the
+    agent stops sending everything, not just the excess. It shows up as a `Disconnected`
+    agent with all its processes running, which is one of the most misleading symptoms
+    Wazuh produces.
+  -->
+  <client_buffer>
+    <disabled>no</disabled>
+    <queue_size>{{ wazuh_agent_queue_size | default(16384) }}</queue_size>
+    <events_per_second>{{ wazuh_agent_events_per_second | default(1000) }}</events_per_second>
+  </client_buffer>
+
+  <!--
+    File integrity monitoring.
+
+    `realtime` uses inotify, which is cheap for a handful of directories and
+    expensive for large trees — watches are per-file and consume kernel memory.
+    So the directories that matter for intrusion detection get realtime, and
+    anything broad is left to the scheduled scan.
+
+    `report_changes` stores a diff of what changed in a text file, which is the
+    difference between "something edited /etc/ssh/sshd_config" and knowing which
+    line. It is deliberately not enabled on binary paths.
+  -->
+  <syscheck>
+    <disabled>no</disabled>
+    <frequency>43200</frequency>
+    <scan_on_start>yes</scan_on_start>
+
+    <directories check_all="yes" realtime="yes" report_changes="yes">/etc</directories>
+    <directories check_all="yes" realtime="yes">/usr/bin,/usr/sbin</directories>
+    <directories check_all="yes" realtime="yes">/bin,/sbin</directories>
+    <directories check_all="yes" realtime="yes">/boot</directories>
+
+    <!--
+      PERSISTENCE PATHS. Added after the 2026-08-12 incident: the malware on the
+      compromised agent copied itself to /lib/libudev.so — a 32-bit ELF executable disguised as a library —
+      and installed itself in /etc/init.d with S90 links in rc1 through rc5. FIM was
+      watching /usr/bin and saw the create/delete cycle, but NONE of these paths were in
+      scope, so the persistence was found by hand.
+
+      Without this, YARA would never scan libudev.so, because nothing would trigger the
+      scan.
+    -->
+    <!--
+      NO `realtime`, and that is deliberate. /usr/lib is ~21,700 files; watching them in
+      real time means one inotify watch per file plus recomputing MD5+SHA1+SHA256 on every
+      change. On a busy host — or one with malware creating files every few seconds — that
+      overflows the agent's queue:
+
+        wazuh-logcollector: WARNING: Target 'agent' message queue is full (1024).
+
+      and the agent stops sending EVERYTHING, not just FIM events: it shows as
+      `Disconnected` on the manager with its processes alive. Observed on 2026-08-13.
+
+      The scheduled scan (`frequency`) covers this tree perfectly well: what matters here is
+      detecting a planted .so, not the exact instant it appears. Realtime is reserved for
+      small, high-value trees such as /etc/init.d just below.
+    -->
+    <directories check_all="yes">/lib,/usr/lib</directories>
+    <directories check_all="yes" realtime="yes" report_changes="yes">/etc/init.d</directories>
+    <directories check_all="yes" realtime="yes">/etc/rc0.d,/etc/rc1.d,/etc/rc2.d,/etc/rc3.d</directories>
+    <directories check_all="yes" realtime="yes">/etc/rc4.d,/etc/rc5.d,/etc/rc6.d,/etc/rcS.d</directories>
+{% if wazuh_group_name == 'vps' %}
+
+    <!--
+      Internet-facing hosts. These are the paths an attacker actually touches:
+      web content, cron persistence, and the systemd units used to survive reboot.
+    -->
+    <directories check_all="yes" realtime="yes" report_changes="yes">/var/www</directories>
+    <directories check_all="yes" realtime="yes" report_changes="yes">/etc/cron.d,/etc/cron.daily,/etc/cron.hourly</directories>
+    <directories check_all="yes" realtime="yes" report_changes="yes">/var/spool/cron</directories>
+    <directories check_all="yes" realtime="yes" report_changes="yes">/etc/systemd/system</directories>
+    <directories check_all="yes" realtime="yes">/root/.ssh,/home</directories>
+{% endif %}
+
+    <!-- Paths that change constantly on their own and would bury real signal. -->
+    <ignore type="sregex">.log$|.swp$|.tmp$</ignore>
+    <ignore>/etc/mtab</ignore>
+    <ignore>/etc/resolv.conf</ignore>
+    <ignore>/etc/adjtime</ignore>
+
+    <skip_nfs>yes</skip_nfs>
+    <skip_dev>yes</skip_dev>
+    <skip_proc>yes</skip_proc>
+    <skip_sys>yes</skip_sys>
+  </syscheck>
+
+  <!--
+    Security Configuration Assessment: benchmarks the host against CIS policies
+    and reports what fails. This is the check that tells you the machine is
+    misconfigured before anyone exploits the misconfiguration.
+  -->
+  <sca>
+    <enabled>yes</enabled>
+    <scan_on_start>yes</scan_on_start>
+    <interval>12h</interval>
+    <skip_nfs>yes</skip_nfs>
+  </sca>
+
+  <!--
+    Rootkit and anomaly detection. Cheap, and catches the crude end of the
+    persistence spectrum.
+  -->
+  <rootcheck>
+    <disabled>no</disabled>
+    <frequency>43200</frequency>
+    <check_files>yes</check_files>
+    <check_trojans>yes</check_trojans>
+    <check_dev>yes</check_dev>
+    <check_sys>yes</check_sys>
+    <check_pids>yes</check_pids>
+    <check_ports>yes</check_ports>
+    <check_if>yes</check_if>
+  </rootcheck>
+
+  <!--
+    Inventory. Feeds the vulnerability detector on the manager: it correlates the
+    installed package list against CVE feeds, so without this the agent reports no
+    vulnerabilities at all.
+  -->
+  <wodle name="syscollector">
+    <disabled>no</disabled>
+    <interval>1h</interval>
+    <scan_on_start>yes</scan_on_start>
+    <hardware>yes</hardware>
+    <os>yes</os>
+    <network>yes</network>
+    <packages>yes</packages>
+    <ports all="no">yes</ports>
+    <processes>yes</processes>
+  </wodle>
+
+  <!--
+    Log sources.
+
+    journald is NOT declared here: the agent's local ossec.conf already ships it, and
+    declaring it in the shared configuration too duplicates it. Same mistake that was made
+    with active-responses.log — logcollector warns `is duplicated` and drops one of the two.
+  -->
+
+  <!--
+    THE YARA SWEEP'S OWN LOG.
+
+    /var/ossec/logs/active-responses.log is NOT declared here, deliberately: the agent's
+    LOCAL ossec.conf already ships it out of the box. Declaring it here as well produces
+
+      wazuh-logcollector: WARNING: (1958): Log file '...active-responses.log' is duplicated.
+
+    and Wazuh drops one of the two declarations. Adding it was a mistake: the active
+    response's output was being collected by the local configuration all along.
+
+    The sweep writes to its own file for two reasons: it duplicates no declaration, and it
+    does not mix its results into the active response audit trail — which on a host under
+    investigation is evidence and is best left untouched.
+
+    The decoder does not care about the source: it matches on the `wazuh-yara:` prefix, so
+    both paths produce the same alerts. See local_decoder.xml.j2.
+  -->
+  <localfile>
+    <log_format>syslog</log_format>
+    <location>/var/ossec/logs/yara-scan.log</location>
+  </localfile>
+
+  <localfile>
+    <log_format>syslog</log_format>
+    <location>/var/log/auth.log</location>
+  </localfile>
+
+  <localfile>
+    <log_format>syslog</log_format>
+    <location>/var/log/syslog</location>
+  </localfile>
+{% if wazuh_group_name == 'vps' %}
+
+  <localfile>
+    <log_format>syslog</log_format>
+    <location>/var/log/nginx/access.log</location>
+  </localfile>
+
+  <localfile>
+    <log_format>syslog</log_format>
+    <location>/var/log/nginx/error.log</location>
+  </localfile>
+{% endif %}
+
+</agent_config>

@@ -1,0 +1,93 @@
+---
+# =============================================================================
+# Centralised agent configuration
+# =============================================================================
+# An agent that is merely *connected* is not monitored. Out of the box it reports
+# little more than "I am alive"; file-integrity monitoring and configuration
+# assessment have to be switched on.
+#
+# Wazuh's mechanism is a shared `agent.conf` per group, held on the manager and
+# pushed to every member. One file governs a whole class of host, and a new VPS
+# inherits the policy the moment it registers — rather than each agent being
+# configured by hand, which is how monitoring quietly diverges from intent.
+#
+# Note where these files live: /var/ossec/etc is the `wazuh_etc` Docker *volume*,
+# not a path on the VM. So the config is rendered locally and copied into the
+# running container, rather than templated to a host path that does not exist.
+# =============================================================================
+
+- name: Check which agent groups already exist
+  # Testing for the group's directory rather than parsing agent_groups' output.
+  # `agent_groups -a` exits non-zero when the group exists, so its exit code
+  # cannot distinguish "created" from "already there", and matching on its English
+  # messages breaks the day upstream rewords them.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - wazuh.manager
+      - test
+      - -d
+      - "/var/ossec/etc/shared/{{ item }}"
+  register: wazuh_group_exists
+  changed_when: false
+  failed_when: false
+  loop: "{{ wazuh_agent_groups }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Create the missing agent groups
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - wazuh.manager
+      - /var/ossec/bin/agent_groups
+      - -a
+      - -g
+      - "{{ item.item }}"
+      - -q
+  when: item.rc != 0
+  changed_when: true
+  loop: "{{ wazuh_group_exists.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Render the shared agent configuration
+  ansible.builtin.template:
+    src: agent.conf.j2
+    dest: "{{ wazuh_install_dir }}/agent-conf/{{ item }}.conf"
+    owner: root
+    group: root
+    mode: "0640"
+  loop: "{{ wazuh_agent_groups }}"
+  loop_control:
+    label: "{{ item }}"
+  vars:
+    wazuh_group_name: "{{ item }}"
+
+- name: Copy the shared agent configuration into the manager
+  # Idempotent: the module compares content and reports changed only on a real
+  # difference, so this does not churn on every run.
+  community.docker.docker_container_copy_into:
+    container: wazuh.manager
+    path: "{{ wazuh_install_dir }}/agent-conf/{{ item }}.conf"
+    container_path: "/var/ossec/etc/shared/{{ item }}/agent.conf"
+    # uid/gid 999 is the `wazuh` user inside the manager image. Copying as root
+    # would leave a config the manager cannot read.
+    owner_id: 999
+    group_id: 999
+    # mode_parse is REQUIRED here, and getting it wrong fails silently.
+    #
+    # This module's default is `legacy`, which parses a *string* "0640" as the
+    # DECIMAL number 640 — mode 0o1200, i.e. --w-----T. Not a permission error, not
+    # a warning: just a file the manager cannot read, and a debugging session.
+    # `octal_string_only` rejects anything that is not an octal string, so the
+    # ambiguity cannot arise.
+    mode: "0640"
+    mode_parse: octal_string_only
+  loop: "{{ wazuh_agent_groups }}"
+  loop_control:
+    label: "{{ item }}"
+  register: wazuh_agent_conf_copied
+  notify: Reload wazuh agent groups

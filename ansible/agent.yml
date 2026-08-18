@@ -1,0 +1,81 @@
+---
+# =============================================================================
+# Enrol hosts as Wazuh agents
+# =============================================================================
+#   make agent-local                       this workstation (same LAN, no overlay)
+#   make tunnel                            build/refresh the overlay only
+#   make agent HOSTS=wazuh_agents_tunnel   a VPS or other host with no route here
+#   make agent HOSTS=wazuh_agents          everything
+#
+# Two plays, and the split is structural rather than stylistic. The overlay's key
+# exchange requires the hub and every spoke to be in ONE play: each host generates its
+# own keypair, publishes only its public key as a fact, and then templates its config
+# from the other hosts' facts. Ansible's default `linear` strategy runs each task
+# across all hosts before starting the next, so by the time any host writes a config,
+# every host has published its key. Split across two plays, that guarantee is lost.
+# =============================================================================
+
+- name: Build the WireGuard overlay
+  # The hub and the spokes together. Skipped entirely when no host needs an overlay.
+  hosts: wireguard_mesh
+  become: true
+  gather_facts: true
+  tags: [wireguard, tunnel]
+
+  tasks:
+    - name: Establish the overlay on every mesh member
+      ansible.builtin.include_role:
+        name: wireguard
+      # A mesh of one is the hub alone, which has nothing to peer with. That happens
+      # whenever the inventory has no tunnel agents.
+      when: groups['wazuh_agents_tunnel'] | default([]) | length > 0
+
+- name: Enrol Wazuh agents
+  hosts: "{{ target_hosts | default('wazuh_agents') }}"
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Require a manager address
+      ansible.builtin.assert:
+        that:
+          - wazuh_manager_address | default('') | length > 0
+        fail_msg: >-
+          No Wazuh manager address for {{ inventory_hostname }}.
+
+          Hosts must belong to wazuh_agents_lan or wazuh_agents_tunnel, which is what
+          supplies this value — see ansible/examples/vps.example. To override:
+            -e wazuh_manager_address=<address>
+        quiet: true
+
+    - name: Report how this agent will reach the manager
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} -> {{ wazuh_manager_address }}:{{ wazuh_agent_comm_port | default(1514) }}
+          ({{ 'through the WireGuard overlay' if wazuh_agent_needs_tunnel | default(false) | bool
+              else 'directly on the LAN' }},
+          Wazuh group: {{ wazuh_agent_group | default('default') }})
+
+    - name: Confirm the overlay address is reachable before enrolling
+      # The agent is about to be pointed at an address that only exists inside the
+      # tunnel. Checking it here means a broken overlay fails with "the tunnel is
+      # down" rather than as a mysterious agent that installs and never connects.
+      ansible.builtin.command:
+        cmd: "ping -c2 -W3 {{ wazuh_manager_address }}"
+      changed_when: false
+      when: wazuh_agent_needs_tunnel | default(false) | bool
+
+  roles:
+    - role: wazuh_agent
+      tags: [agent]
+
+    # After the agent, not before: the role installs its script into
+    # /var/ossec/active-response/bin/, which only exists once the wazuh-agent package is
+    # in place.
+    #
+    # Gated on `yara_enabled` because the active response launches a scan as root on every
+    # FIM event. It is turned on per group or per host, once somebody has decided that host
+    # can afford it. See roles/yara/defaults/main.yml.
+    - role: yara
+      when: yara_enabled | default(false) | bool
+      tags: [yara]

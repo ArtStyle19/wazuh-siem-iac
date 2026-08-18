@@ -1,0 +1,45 @@
+---
+# =============================================================================
+# Day-0 provisioning for a host Terraform did not create
+# =============================================================================
+#   make bootstrap HOSTS=<pattern>
+#
+# The lab's own VM gets its automation account from cloud-init. A pre-existing
+# machine — a VPS you rented, or a VM that predates this project — does not, and
+# nothing else can run unattended until it does. Every managed fleet has this step.
+#
+# Run ONCE per host, with the credentials you already have for it: it prompts for the
+# SSH password and the sudo password. Afterwards the host is reachable as
+# `wazuh-ansible` with key auth and passwordless sudo, so every later playbook treats
+# all bootstrapped hosts identically.
+#
+# If the host ALREADY has a passwordless automation account (re-bootstrapping, or
+# renaming the account), connect through it and skip the sudo prompt:
+#
+#   make bootstrap HOSTS=<pattern> BOOTSTRAP_USER=<old-account> NO_BECOME_PASS=1
+#
+# It deliberately does NOT touch your own account. Your human login keeps its password
+# requirement; the automation account is key-only and cannot be used interactively.
+# =============================================================================
+
+- name: Bootstrap the automation account
+  hosts: "{{ target_hosts | default('bootstrap_targets') }}"
+  become: true
+  gather_facts: true
+
+  # Connect as the human user for this one run. `ansible_user` for the host normally
+  # names the automation account, which does not exist yet — hence the override.
+  vars:
+    ansible_user: "{{ bootstrap_initial_user | default(lookup('env', 'USER')) }}"
+
+  pre_tasks:
+    - name: Show what this will do
+      ansible.builtin.debug:
+        msg: >-
+          Bootstrapping {{ inventory_hostname }} as {{ ansible_user }}:
+          creating the '{{ bootstrap_user }}' automation account
+          with key auth and a NOPASSWD sudoers drop-in. Your own account is untouched.
+
+  roles:
+    - role: bootstrap
+      tags: [bootstrap]

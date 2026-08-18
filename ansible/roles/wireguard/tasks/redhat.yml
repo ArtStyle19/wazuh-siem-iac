@@ -1,0 +1,36 @@
+---
+# =============================================================================
+# WireGuard userspace tooling on the RedHat family
+# =============================================================================
+# The kernel side needs nothing: WireGuard is in-tree from 5.6, so every Fedora and
+# every RHEL 9 derivative already has the module. Only `wg` and `wg-quick` are needed.
+#
+# WHERE THAT PACKAGE LIVES IS NOT THE SAME ACROSS THE FAMILY, which is the whole reason
+# this file is more than one task:
+#
+#   Fedora            wireguard-tools is in the main repository.
+#   Rocky / Alma /    it is NOT in baseos or appstream. It is in EPEL, so a plain
+#   CentOS / RHEL     `dnf install wireguard-tools` fails with
+#                     "No match for argument: wireguard-tools" — which reads like a
+#                     typo rather than a missing repository.
+#
+# `ansible_os_family` is 'RedHat' for all of them, so branching on the family is not
+# enough; the distribution itself has to be checked.
+# =============================================================================
+
+- name: Enable EPEL for the WireGuard tooling
+  # Rocky, Alma and CentOS Stream all ship `epel-release` in their extras repository,
+  # which is enabled by default — so naming the package is enough and is idempotent.
+  #
+  # RHEL proper does not carry epel-release at all. There, install it from the EPEL URL
+  # (and enable codeready-builder) before running this role:
+  #   dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+  ansible.builtin.dnf:
+    name: epel-release
+    state: present
+  when: ansible_distribution != 'Fedora'
+
+- name: Install WireGuard tooling
+  ansible.builtin.dnf:
+    name: wireguard-tools
+    state: present

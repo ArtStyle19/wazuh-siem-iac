@@ -1,0 +1,97 @@
+---
+# =============================================================================
+# Making the firewall actually govern the Wazuh ports
+# =============================================================================
+# This project has documented, since the first deploy, that ufw does NOT protect the
+# Wazuh containers: Docker inserts its own rules into the nat and filter tables, and
+# they are traversed before ufw's chains. A published container port is reachable even
+# when ufw's policy says deny. Until now that was a caveat in a comment.
+#
+# DOCKER-USER is the supported answer. Docker creates that chain, jumps to it FIRST
+# from FORWARD, and — uniquely — never flushes it. Rules placed here are evaluated
+# before Docker's own ACCEPTs, so they are the only firewall rules that can actually
+# restrict a published port.
+#
+# What this buys, concretely: the agent ports stop being open to the manager's whole
+# LAN and are reachable only from the WireGuard subnet. On a VPS that is the
+# difference between 1514/1515 open to the internet and open to nobody. It is also
+# what makes the overlay demonstrably load-bearing rather than merely configured —
+# with these rules, there is no direct path even from a host on the same network.
+#
+# Two things to know before editing:
+#
+#   * Ordering matters. `insert` puts each rule at the top of DOCKER-USER, so the
+#     final rule inserted is evaluated first. The RETURN at the end is Docker's own
+#     default and must stay last.
+#   * iptables rules do not survive a reboot. The systemd unit below reapplies them
+#     after docker.service, which is more transparent than iptables-persistent and
+#     does not fight Docker over who owns the ruleset.
+# =============================================================================
+
+- name: Install iptables tooling
+  ansible.builtin.apt:
+    name: iptables
+    state: present
+
+- name: Deploy the DOCKER-USER rule script
+  ansible.builtin.template:
+    src: docker-user-rules.sh.j2
+    dest: /usr/local/sbin/wazuh-docker-firewall
+    owner: root
+    group: root
+    mode: "0750"
+  register: wazuh_docker_fw_script
+
+- name: Install the unit that reapplies the rules after Docker starts
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/wazuh-docker-firewall.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (role: common)
+      #
+      # iptables rules are not persistent. Docker recreates its chains on every start,
+      # so the rules must be reapplied after it — ordering on docker.service is the
+      # whole point of this unit.
+      [Unit]
+      Description=Restrict Docker-published Wazuh ports to the WireGuard overlay
+      After=docker.service network-online.target
+      Requires=docker.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/wazuh-docker-firewall
+
+      [Install]
+      WantedBy=multi-user.target
+  register: wazuh_docker_fw_unit
+
+- name: Enable and apply the rules
+  ansible.builtin.systemd_service:
+    name: wazuh-docker-firewall
+    state: restarted
+    enabled: true
+    daemon_reload: true
+  when: wazuh_docker_fw_script.changed or wazuh_docker_fw_unit.changed
+
+- name: Ensure the rules are active even when nothing changed
+  # The unit is oneshot + RemainAfterExit, so systemd reports it active without
+  # re-running it. Verify the rules are genuinely in the live table rather than
+  # trusting unit state — a reboot or a Docker restart could have cleared them
+  # between runs.
+  ansible.builtin.command:
+    cmd: >-
+      iptables -C DOCKER-USER -p tcp --dport 1514
+      -s {{ common_wazuh_agent_allowed_sources | first }} -j ACCEPT
+  register: wazuh_docker_fw_present
+  changed_when: false
+  failed_when: false
+
+- name: Reapply the rules if they are missing from the live ruleset
+  ansible.builtin.systemd_service:
+    name: wazuh-docker-firewall
+    state: restarted
+  when: wazuh_docker_fw_present.rc != 0

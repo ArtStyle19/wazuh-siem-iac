@@ -1,0 +1,47 @@
+---
+# =============================================================================
+# SSH hardening
+# =============================================================================
+# cloud-init already set ssh_pwauth: false and disable_root: true. This makes
+# those settings explicit in a drop-in that survives a cloud-init re-run, and
+# adds the parts cloud-init does not cover.
+#
+# Written to /etc/ssh/sshd_config.d/ rather than editing sshd_config, because
+# Debian's sshd_config starts with `Include /etc/ssh/sshd_config.d/*.conf`:
+# first-match-wins means a drop-in reliably overrides the main file, and package
+# upgrades never conflict with it.
+# =============================================================================
+
+- name: Deploy the sshd hardening drop-in
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/50-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (role: common). Do not edit by hand.
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PubkeyAuthentication yes
+
+      # Drop dead sessions rather than accumulating them.
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+
+      MaxAuthTries 4
+      X11Forwarding no
+      AllowAgentForwarding no
+      PermitEmptyPasswords no
+  notify: Restart sshd
+
+# Validate the MERGED configuration, not the fragment.
+#
+# `copy`'s own validate= would run `sshd -t` against the drop-in in isolation,
+# which tests something that is never what sshd actually loads. Checking the
+# real config here — before the handler fires at end of play — means a mistake
+# fails the run while the current sshd is still happily serving our connection.
+# Getting this backwards is how people lock themselves out of a host.
+- name: Verify the effective sshd configuration parses
+  ansible.builtin.command: /usr/sbin/sshd -t
+  changed_when: false

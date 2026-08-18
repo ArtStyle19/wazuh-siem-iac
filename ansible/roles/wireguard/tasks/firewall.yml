@@ -1,0 +1,81 @@
+---
+# =============================================================================
+# Open the overlay port on hosts that must ACCEPT handshakes
+# =============================================================================
+# Only hosts with `wireguard_listen` true need this. The side that dials needs nothing
+# inbound: its reply arrives on the flow it opened, which conntrack already permits.
+#
+# This lives in the wireguard role rather than in `common` because `common` is applied to
+# the manager only (site.yml), while the hosts that have to listen are agents. That gap
+# stayed invisible because the first remote agent was an Ubuntu cloud image with no
+# firewall installed at all, so its handshake worked and nothing pointed at the omission.
+#
+# A RHEL-family host is the opposite case: firewalld is installed AND running by default.
+# There the handshake is dropped silently and the only symptom is
+# `Require a working tunnel with the peers this host dials` failing after 60s — which
+# reads as a routing or NAT problem, not a local firewall.
+#
+# WHY DETECT RATHER THAN BRANCH ON os_family: what matters is which firewall is actually
+# filtering on this host right now. A Debian host may have no ufw; a RHEL host may have
+# firewalld masked; a cloud instance may rely entirely on a provider security group. Any
+# of those combinations occurs in practice, and os_family predicts none of them.
+# =============================================================================
+
+- name: Check for a running firewalld
+  ansible.builtin.command:
+    cmd: firewall-cmd --state
+  register: wireguard_firewalld
+  changed_when: false
+  # A missing binary and an inactive daemon both mean "not the firewall in charge here",
+  # and neither is an error worth stopping the play for.
+  failed_when: false
+  # Read-only, so it must still run under --check or the tasks below cannot decide.
+  check_mode: false
+
+- name: Check for an active ufw
+  ansible.builtin.command:
+    cmd: ufw status
+  register: wireguard_ufw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Open the WireGuard port in firewalld
+  ansible.posix.firewalld:
+    port: "{{ wireguard_port }}/udp"
+    state: enabled
+    # BOTH, and this is the pair people get wrong. `permanent` alone writes the config
+    # but does not touch the running firewall, so handshakes keep failing until something
+    # reloads it — and the reload is easy to forget because the config looks right.
+    # `immediate` alone works now and disappears on reboot, which produces a tunnel that
+    # dies at the least convenient moment.
+    permanent: true
+    immediate: true
+  when: wireguard_firewalld.stdout | trim == 'running'
+
+- name: Open the WireGuard port in ufw
+  community.general.ufw:
+    rule: allow
+    port: "{{ wireguard_port }}"
+    proto: udp
+    comment: WireGuard overlay
+  # Matching on the status line rather than on the binary existing: ufw can be installed
+  # and inactive, in which case adding a rule changes nothing that is enforced and would
+  # imply a protection that is not there.
+  when: "'Status: active' in wireguard_ufw.stdout | default('')"
+
+- name: Report that no host firewall governs this port
+  # Said out loud rather than passed over. "Port opened" and "no firewall found" produce
+  # identical WireGuard behaviour on a host whose provider permits the traffic, so
+  # without this line an operator cannot tell which happened — and the difference decides
+  # whether the host is protected the day someone enables a firewall on it.
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} listens on {{ wireguard_port }}/udp but has neither a
+      running firewalld nor an active ufw, so nothing ON THIS HOST is filtering it.
+      Inbound access depends entirely on the provider's firewall or security group —
+      confirm {{ wireguard_port }}/udp is permitted there, and note that no other port
+      is protected on this host either.
+  when:
+    - wireguard_firewalld.stdout | trim != 'running'
+    - "'Status: active' not in wireguard_ufw.stdout | default('')"

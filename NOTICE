@@ -1,0 +1,61 @@
+THIRD-PARTY MATERIAL AND MIXED LICENSING
+========================================
+
+This project is MIT licensed (see LICENSE), with the exception of the files
+listed below. Those derive from Wazuh's own repositories and remain under the
+licence they came with.
+
+This matters and is stated plainly because "the repo says MIT" is not a defence
+if some of its files are GPL-derived. Anyone reusing this code needs to know which
+parts carry which obligations.
+
+
+GPL-2.0 — derived from wazuh/wazuh-docker
+-----------------------------------------
+Source:    https://github.com/wazuh/wazuh-docker  (tag v4.14.7, single-node/)
+Copyright: Wazuh, Inc. — "Wazuh App Copyright (C) 2017, Wazuh Inc. (License GPLv2)"
+Licence:   GNU General Public License, version 2
+
+  ansible/roles/wazuh_stack/templates/wazuh_manager.conf.j2
+      Substantially verbatim copy of single-node/config/wazuh_cluster/
+      wazuh_manager.conf. Modified only to read the cluster key from Ansible
+      Vault instead of carrying upstream's published demo value.
+
+  ansible/roles/wazuh_stack/templates/compose.yaml.j2
+      Derived from single-node/docker-compose.yml. Modified to template
+      credentials from Ansible Vault, to set container_name, to make publishing
+      the indexer's port optional, to add an indexer healthcheck, and to drop the
+      obsolete `links:` keys.
+
+  ansible/roles/wazuh_stack/templates/wazuh.indexer.yml.j2
+  ansible/roles/wazuh_stack/templates/opensearch_dashboards.yml.j2
+  ansible/roles/wazuh_stack/templates/wazuh.yml.j2
+  ansible/roles/wazuh_stack/templates/certs.yml.j2
+  ansible/roles/wazuh_stack/templates/internal_users.yml.j2
+      Derived from the corresponding files under single-node/config/. Modified as
+      documented in the header comment of each file.
+
+A copy of the GPL-2.0 text is available at
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+
+Container images
+----------------
+The deployment pulls, but does not redistribute, these images:
+
+  wazuh/wazuh-manager, wazuh/wazuh-indexer, wazuh/wazuh-dashboard
+      Wazuh, Inc. — GPL-2.0
+  wazuh/wazuh-certs-generator
+      Wazuh, Inc. — GPL-2.0
+  Debian 13 (trixie) genericcloud image
+      Software in the Public Interest / Debian, various free licences
+
+Wazuh is a trademark of Wazuh, Inc. This project is not affiliated with or
+endorsed by Wazuh, Inc.
+
+
+Everything else
+---------------
+The Terraform configuration, the libvirt-vm module, the common / docker /
+wireguard / wazuh_agent / bootstrap roles, the agent.conf template, the Makefile, the scripts
+and the documentation are original work under the MIT licence in LICENSE.

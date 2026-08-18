@@ -1,0 +1,115 @@
+---
+# =============================================================================
+# yara — content-based malware identification, triggered by FIM
+# =============================================================================
+# FIM tells you THAT a file appeared. YARA tells you WHAT it is.
+#
+# This role exists because of the 2026-08-12 incident on a compromised internet-facing
+# agent: Wazuh recorded
+# 910 events of binaries being created and deleted in /usr/bin every 5 seconds, but a
+# human identified the family (XorDDoS) by hand — capturing a copy through
+# /proc/<pid>/exe and reading strings out of it. YARA matches on CONTENT, so this
+# family's polymorphism (three copies, three different hashes) does not defeat it.
+#
+# The full chain:
+#   FIM sees the file        ->  alert 554/550 on the manager
+#   the manager fires active response on THAT agent
+#   yara.sh scans the file and writes to its log
+#   the agent ships that log ->  decoder + custom rule  ->  alert naming the family
+# =============================================================================
+
+# DISABLED BY DEFAULT, deliberately.
+#
+# Active response runs a scan as root every time FIM sees a new file. On the compromised
+# host that would have been 910 scans in three hours on a machine already at 275% CPU. This role is
+# enabled per group or per host once someone has decided that host can afford it — not
+# because it happens to be installed.
+yara_enabled: false
+
+# ---------------------------------------------------------------------------
+# Public rule set, pinned by commit
+# ---------------------------------------------------------------------------
+# elastic/protections-artifacts rather than signature-base, and that was a measured
+# decision: signature-base does NOT cover XorDDoS, and only 5 of its 746 files are Linux
+# — it targets Windows and APT tooling. Elastic ships 248 Linux_* files with 902 rules,
+# including 24 XorDDoS variants.
+#
+# The pin is a commit SHA, not a tarball plus sha256. A git SHA IS a content hash, so git
+# verifies the checkout by itself; GitHub tarballs have changed bytes through
+# recompression and broken sha256 pins in the past.
+yara_rules_repo: https://github.com/elastic/protections-artifacts.git
+yara_rules_commit: 3835eb47bdcc4ce12b934bb0e98ddf1f1be7644b
+
+# Linux rules only. The whole estate is Linux, and filtering avoids dragging in Windows
+# rules that need the `pe` module. Verified: the Linux subset imports no modules, uses no
+# external variables, and has no duplicate rule identifiers, so it compiles cleanly as one
+# concatenated file.
+yara_rules_glob: "Linux_*.yar"
+
+# Cached on the CONTROL NODE. The download happens once, not once per agent: every agent
+# then gets identical rules, and only the control node needs outbound internet.
+yara_rules_cache: "~/.cache/wazuh-siem-iac/protections-artifacts"
+
+# ---------------------------------------------------------------------------
+# Paths on the agent
+# ---------------------------------------------------------------------------
+yara_dir: /var/ossec/yara
+yara_rules_file: "{{ yara_dir }}/rules/public.yar"
+yara_local_rules_dir: "{{ yara_dir }}/rules.local"
+yara_active_response_script: /var/ossec/active-response/bin/yara.sh
+
+# ---------------------------------------------------------------------------
+# Scan guards — all three are load-bearing, none is redundant
+# ---------------------------------------------------------------------------
+# 1. Prefix allowlist. The strongest guard: rule 554 fires for any new file in any
+#    monitored path, so without this a `git clone` under /home would launch hundreds of
+#    root scans. The script exits immediately when the path does not match, before
+#    spending anything.
+yara_scan_paths:
+  - /usr/bin
+  - /usr/sbin
+  - /bin
+  - /sbin
+  - /lib
+  - /usr/lib
+  - /etc/init.d
+  - /tmp
+  - /var/tmp
+  - /dev/shm
+
+# 2. Size ceiling. Scanning a 2 GB disk image adds nothing and blocks everything else.
+yara_max_file_size_kb: 51200
+
+# 3. Timeout and mutual exclusion. `flock` stops a burst of FIM events from overlapping
+#    scans; the ones that arrive mid-scan are DROPPED rather than queued, because queuing
+#    them is what turns a burst into an outage.
+yara_scan_timeout: 60
+yara_lock_file: /var/ossec/var/run/yara-scan.lock
+
+# ---------------------------------------------------------------------------
+# On-demand / scheduled sweep
+# ---------------------------------------------------------------------------
+# Active response only sees what CHANGES. A sweep sees what IS THERE, and it is the only
+# thing that finds malware already on disk when the agent was installed — the case that
+# motivated this role, where FIM's baseline recorded the implant as normal state.
+yara_sweep_script: /var/ossec/active-response/bin/yara-scan.sh
+# Log of its own. logcollector reads it as the `wazuh` user, so the file must belong to
+# that group — created root:root 0600 the agent cannot read it and the sweep runs without
+# anyone seeing the results.
+yara_sweep_log: /var/ossec/logs/yara-scan.log
+
+# TOTAL budget for a sweep, not per file — with --scan-list yara is invoked once.
+# 30 minutes covers /usr with room to spare; on expiry it is logged and the matches found
+# so far are kept.
+yara_sweep_timeout: 1800
+
+# Also scan the binaries of running processes through /proc/<pid>/exe. It is the only way
+# to see malware that deletes itself after execution, and it is cheap: one yara invocation
+# over the deduplicated list.
+yara_scan_processes: true
+
+# NOTE: this role does NOT schedule the sweep. It installs the script and runs it on
+# demand through `make yara-scan`. Scheduling is left to the operator on purpose —
+# a recursive sweep reads thousands of files, and how often that is acceptable depends on
+# the host. docs/YARA.md gives a systemd timer and a cron recipe to copy, and explains why
+# a Wazuh `wodle command` is the wrong place for it here.

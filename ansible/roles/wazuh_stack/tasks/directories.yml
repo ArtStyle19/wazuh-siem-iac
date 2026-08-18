@@ -1,0 +1,21 @@
+---
+- name: Create the Wazuh deployment tree
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  loop:
+    - "{{ wazuh_install_dir }}"
+    - "{{ wazuh_config_dir }}"
+    - "{{ wazuh_config_dir }}/wazuh_indexer"
+    - "{{ wazuh_config_dir }}/wazuh_dashboard"
+    - "{{ wazuh_config_dir }}/wazuh_cluster"
+    # Staging for the shared agent.conf files. They are rendered here and then
+    # copied into the manager container, because their real home is inside the
+    # wazuh_etc volume rather than on this filesystem.
+    - "{{ wazuh_install_dir }}/agent-conf"
+    # Staging for the custom rules and decoders. Same reason as agent-conf: their real
+    # home is inside the wazuh_etc volume rather than on this filesystem.
+    - "{{ wazuh_install_dir }}/custom-rules"

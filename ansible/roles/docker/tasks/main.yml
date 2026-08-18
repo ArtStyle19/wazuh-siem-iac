@@ -1,0 +1,113 @@
+---
+- name: Install repository prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# =============================================================================
+# Repository trust
+# =============================================================================
+# /etc/apt/keyrings + Signed-By is the current way to trust a third-party repo.
+# The pattern it replaces — `apt-key add` into the global trusted keyring — is
+# deprecated because it lets any repo you have ever added sign packages for
+# every other repo, Debian's own included. Signed-By scopes the key to exactly
+# one source.
+# =============================================================================
+
+- name: Create the apt keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install Docker's repository signing key
+  ansible.builtin.get_url:
+    url: "{{ docker_apt_gpg_url }}"
+    dest: "{{ docker_apt_keyring }}"
+    owner: root
+    group: root
+    # World-readable on purpose: _apt drops privileges and must be able to read
+    # the keyring, or apt update fails with a permission error.
+    mode: "0644"
+  register: docker_key
+
+- name: Configure the Docker apt repository
+  # deb822 (.sources) rather than the one-line .list format: it is the format
+  # apt itself is moving to, and it does not need python3-debian the way the
+  # deb822_repository module does.
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/docker.sources
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (role: docker)
+      Types: deb
+      URIs: {{ docker_apt_repo_url }}
+      Suites: {{ docker_apt_suite }}
+      Components: {{ docker_apt_component }}
+      Architectures: {{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }}
+      Signed-By: {{ docker_apt_keyring }}
+  register: docker_repo
+
+- name: Remove Debian's conflicting docker packages
+  # docker.io and the podman-docker shim both own /usr/bin/docker.
+  ansible.builtin.apt:
+    name:
+      - docker.io
+      - docker-doc
+      - docker-compose
+      - podman-docker
+      - containerd
+      - runc
+    state: absent
+
+- name: Install Docker CE
+  ansible.builtin.apt:
+    name: "{{ docker_packages }}"
+    state: present
+    update_cache: "{{ (docker_repo.changed or docker_key.changed) | bool }}"
+
+- name: Configure the Docker daemon
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ docker_daemon_options | to_nice_json }}"
+  notify: Restart docker
+
+- name: Enable and start Docker
+  ansible.builtin.systemd_service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Grant socket access to operators
+  ansible.builtin.user:
+    name: "{{ item }}"
+    groups: docker
+    append: true
+  loop: "{{ docker_users }}"
+
+# Group membership is established at login. Without this, the current SSH
+# session still lacks the docker group and any later non-become docker task
+# fails with a permission error on /var/run/docker.sock.
+- name: Reset the connection so new group membership takes effect
+  ansible.builtin.meta: reset_connection
+
+- name: Verify Docker and the compose plugin are usable
+  ansible.builtin.command: docker compose version --short
+  register: docker_compose_version
+  changed_when: false
+
+- name: Report the installed versions
+  ansible.builtin.debug:
+    msg: "Docker Compose plugin v{{ docker_compose_version.stdout }} is available."

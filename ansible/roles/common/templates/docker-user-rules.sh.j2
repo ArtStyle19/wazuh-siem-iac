@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# =============================================================================
+# MANAGED BY ANSIBLE (role: common) — do not edit on the host.
+# Edit roles/common/templates/docker-user-rules.sh.j2 and re-run `make configure`.
+# =============================================================================
+# Restricts the Wazuh agent ports, which Docker publishes on 0.0.0.0, to the
+# WireGuard overlay.
+#
+# Why DOCKER-USER and not ufw: Docker's rules live in the FORWARD path and are
+# traversed before ufw's chains, so a `ufw deny` on a published port does nothing.
+# DOCKER-USER is the one chain Docker jumps to first and never flushes — it is the
+# only place a rule can actually restrict a published port.
+#
+# Idempotent: every rule is deleted before being inserted, so running this twice
+# leaves one copy of each.
+# =============================================================================
+set -euo pipefail
+
+# Space-separated list of CIDRs allowed to reach the agent ports. Rendered from
+# common_wazuh_agent_allowed_sources — normally the WireGuard overlay plus the
+# manager's own network (for LAN agents). See roles/common/defaults/main.yml.
+ALLOWED_SOURCES="{{ common_wazuh_agent_allowed_sources | join(' ') }}"
+CHAIN="DOCKER-USER"
+
+# Ports that must ONLY be reachable over the overlay. The dashboard (443) and the
+# API (55000) are deliberately absent: you reach those from the hypervisor or through
+# a reverse proxy, and locking them here would cut off your own browser.
+AGENT_PORTS_TCP="{{ wazuh_agent_comm_port | default(1514) }} {{ wazuh_agent_enroll_port | default(1515) }}"
+SYSLOG_PORT_UDP="{{ wazuh_syslog_port | default(514) }}"
+
+# Docker creates DOCKER-USER itself, but this script may run before Docker has ever
+# started, or on a host where it was removed.
+iptables -N "$CHAIN" 2>/dev/null || true
+
+# --- helpers ----------------------------------------------------------------
+# Delete-then-insert makes each rule idempotent. `iptables -D` is looped because a
+# previous buggy run could have left duplicates.
+drop_rule() { while iptables -C "$CHAIN" "$@" 2>/dev/null; do iptables -D "$CHAIN" "$@"; done; }
+add_rule()  { drop_rule "$@"; iptables -I "$CHAIN" 1 "$@"; }
+
+# --- rules ------------------------------------------------------------------
+# Inserted in reverse priority: the LAST insert ends up first in the chain, so the
+# ACCEPTs below are evaluated before the DROPs above them.
+
+# 3. Default for these ports: refuse.
+for p in $AGENT_PORTS_TCP; do
+  add_rule -p tcp --dport "$p" -j DROP
+done
+add_rule -p udp --dport "$SYSLOG_PORT_UDP" -j DROP
+
+# 2. Established traffic must keep flowing, or the DROPs above would sever replies
+#    to connections the manager itself opened.
+add_rule -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# 1. Allowed sources. Evaluated first because they are inserted last.
+for src in $ALLOWED_SOURCES; do
+  for p in $AGENT_PORTS_TCP; do
+    add_rule -p tcp --dport "$p" -s "$src" -j ACCEPT
+  done
+  add_rule -p udp --dport "$SYSLOG_PORT_UDP" -s "$src" -j ACCEPT
+done
+
+echo "DOCKER-USER: agent ports ${AGENT_PORTS_TCP// /, } and ${SYSLOG_PORT_UDP}/udp restricted to: ${ALLOWED_SOURCES}"
+iptables -S "$CHAIN"

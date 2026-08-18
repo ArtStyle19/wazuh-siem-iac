@@ -1,0 +1,29 @@
+# =============================================================================
+# Lint and validation tooling. Not needed to RUN the project — only to check it.
+# =============================================================================
+#   pip install -r requirements-dev.txt
+#
+# This file exists for two reasons.
+#
+# 1. `actions/setup-python` with `cache: pip` needs a dependency file to hash.
+#    Without one the step fails outright with "No file matched to
+#    [**/requirements.txt or **/pyproject.toml]".
+#
+# 2. More importantly: these are the versions the checks were verified against.
+#    Installing `ansible-lint` unpinned means a release upstream can turn a green
+#    build red on a commit that changed nothing — the same class of bug the
+#    Terraform version pin in ci.yml already designs out.
+#
+# Lower bounds rather than exact pins, because the alternative is a stream of
+# version-bump commits for tooling that is not shipped to anyone. If a new
+# release does break the build, pin that one line to the last working version
+# and say why.
+# =============================================================================
+
+ansible-core>=2.19.0
+ansible-lint>=26.8.0
+yamllint>=1.38.0
+
+# The pip-installable ShellCheck binary, so CI and a workstation without a
+# distribution package use the same one.
+shellcheck-py>=0.11.0

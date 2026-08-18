@@ -1,0 +1,62 @@
+---
+# =============================================================================
+# Swapfile
+# =============================================================================
+# Debian cloud images ship with no swap. On a 4 GiB host running a 1 GiB JVM
+# heap plus a Node.js dashboard, that means the first memory spike is resolved
+# by the OOM killer choosing the largest process — which is always the indexer.
+#
+# Swap does not make 4 GiB into 8 GiB. It buys the kernel somewhere to put cold
+# pages so a transient spike degrades performance instead of killing a service.
+# =============================================================================
+
+- name: Check whether the swapfile already exists
+  ansible.builtin.stat:
+    path: "{{ common_swapfile_path }}"
+  register: swapfile_stat
+
+- name: Allocate the swapfile
+  # fallocate would be faster but produces a file with holes, which mkswap
+  # rejects on some filesystems. dd is slower and always correct.
+  ansible.builtin.command:
+    argv:
+      - dd
+      - if=/dev/zero
+      - of={{ common_swapfile_path }}
+      - bs=1M
+      - count={{ common_swapfile_size_mb }}
+      - status=none
+  when: not swapfile_stat.stat.exists
+  changed_when: true
+
+- name: Restrict the swapfile to root
+  ansible.builtin.file:
+    path: "{{ common_swapfile_path }}"
+    owner: root
+    group: root
+    # mkswap refuses to work on a world-readable file, and rightly so: swap can
+    # contain anything that was ever in memory.
+    mode: "0600"
+
+- name: Format the swapfile
+  ansible.builtin.command: mkswap {{ common_swapfile_path }}
+  when: not swapfile_stat.stat.exists
+  changed_when: true
+
+- name: Enable the swapfile at boot
+  ansible.posix.mount:
+    path: none
+    src: "{{ common_swapfile_path }}"
+    fstype: swap
+    opts: sw
+    state: present
+
+- name: Read active swap devices
+  ansible.builtin.command: swapon --show=NAME --noheadings
+  register: active_swap
+  changed_when: false
+
+- name: Activate the swapfile now
+  ansible.builtin.command: swapon {{ common_swapfile_path }}
+  when: common_swapfile_path not in active_swap.stdout
+  changed_when: true

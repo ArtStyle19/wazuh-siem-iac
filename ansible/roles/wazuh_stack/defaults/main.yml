@@ -1,0 +1,99 @@
+---
+# =============================================================================
+# Wazuh single-node stack
+# =============================================================================
+# Modelled on the upstream wazuh/wazuh-docker `single-node` deployment, with
+# three deliberate changes documented where they occur:
+#   1. every credential comes from Ansible Vault instead of upstream's demo values
+#   2. the indexer's HTTP port is not published to the host by default
+#   3. the unused demo users are removed from internal_users.yml
+# =============================================================================
+
+wazuh_version: "4.14.7"
+
+# Certificate tool releases track the minor line, not the patch: 4.14.7 -> "4.14".
+wazuh_cert_tool_version: "{{ wazuh_version.split('.')[0:2] | join('.') }}"
+wazuh_certs_generator_image: "wazuh/wazuh-certs-generator:0.0.4"
+
+wazuh_install_dir: /opt/wazuh
+wazuh_config_dir: "{{ wazuh_install_dir }}/config"
+wazuh_certs_dir: "{{ wazuh_config_dir }}/wazuh_indexer_ssl_certs"
+
+# Compose project name. Pinned rather than inherited from the directory name so
+# container and volume names never move because someone renamed a folder.
+wazuh_compose_project: wazuh
+
+# ---- Accounts ---------------------------------------------------------------
+# Usernames are fixed by Wazuh; only the passwords are ours. Values come from
+# group_vars/all/vars.yml, which dereferences the vault.
+wazuh_indexer_username: admin
+wazuh_dashboard_username: kibanaserver
+wazuh_api_username: wazuh-wui
+
+# ---- Bind-mount ownership ---------------------------------------------------
+# A bind mount carries NUMERIC ownership into the container. The container has no
+# idea what "root" means on the VM — it sees uid 0, and a file at mode 0640 owned
+# by uid 0 is unreadable to any other uid.
+#
+# So each config file's owner on the host must be the uid its container runs as:
+#
+#   wazuh.indexer     uid 1000 (wazuh-indexer)
+#   wazuh.dashboard   uid 1000 (wazuh-dashboard)
+#   wazuh.manager     root — its entrypoint reads the mounted ossec.conf as root
+#                     before dropping to uid 999 for the daemons
+#
+# Getting this wrong is dramatic in effect and nearly invisible in appearance: the
+# container starts, dies, and `restart: always` renders it as perpetually
+# "Restarting" rather than failed. The real error only shows in `docker logs`:
+#
+#   indexer    SettingsException / AccessDeniedException on opensearch.yml
+#   dashboard  Error: EACCES ... opensearch_dashboards.yml
+#
+# Mode stays 0640 rather than widening to 0644, because wazuh.yml carries the API
+# password in plaintext — world-readable would hand it to every local user on the
+# VM just to sidestep an ownership problem.
+wazuh_indexer_uid: 1000
+wazuh_indexer_gid: 1000
+wazuh_dashboard_uid: 1000
+wazuh_dashboard_gid: 1000
+
+# ---- Resources --------------------------------------------------------------
+# Xms == Xmx is standard JVM practice: a fixed heap avoids the pauses and
+# fragmentation that come from resizing it at runtime. 1g matches upstream and
+# fits a 4 GiB host. Raise it only if you raise vm_memory_mib too.
+wazuh_indexer_heap: 1g
+
+# ---- Ports ------------------------------------------------------------------
+wazuh_dashboard_port: 443
+wazuh_api_port: 55000
+wazuh_agent_comm_port: 1514
+wazuh_agent_enroll_port: 1515
+wazuh_syslog_port: 514
+wazuh_indexer_port: 9200
+
+# See the note in group_vars: the dashboard reaches the indexer over the compose
+# network, so publishing 9200 only widens the attack surface.
+wazuh_expose_indexer: false
+
+# ---- Password rotation ------------------------------------------------------
+# Off by default, and the guard is what keeps this role idempotent: bcrypt uses a
+# fresh salt every time, so re-hashing on every run would rewrite
+# internal_users.yml on every run and never converge.
+#
+# Rotating after the security index has been initialised also requires
+# securityadmin.sh — editing the file alone does nothing. `make rotate-passwords`
+# does both. See docs/TROUBLESHOOTING.md.
+wazuh_force_password_rotation: false
+
+# ---- Agent groups -----------------------------------------------------------
+# Groups a shared agent.conf is pushed to. `default` is what an agent joins when
+# no group is named; `vps` gets the stricter FIM paths for internet-facing hosts.
+# See templates/agent.conf.j2, which branches on the group name.
+wazuh_agent_groups:
+  - default
+  - vps
+
+# ---- Verification -----------------------------------------------------------
+# The indexer needs 1-3 minutes on a 4 GiB host: JVM start, then shard recovery.
+wazuh_verify_retries: 40
+wazuh_verify_delay: 15

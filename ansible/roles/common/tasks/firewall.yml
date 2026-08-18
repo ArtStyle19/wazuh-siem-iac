@@ -1,0 +1,120 @@
+---
+# =============================================================================
+# ufw — and an honest account of what it protects
+# =============================================================================
+# READ THIS BEFORE TRUSTING THIS FIREWALL.
+#
+# Docker inserts its own rules into the nat and filter tables via the DOCKER
+# chain, which is traversed BEFORE ufw's chains. A published container port is
+# therefore reachable even when ufw's policy says deny. Every port the Wazuh
+# stack publishes (443, 1514, 1515, 514/udp, and 9200 if enabled) falls into
+# that category.
+#
+# So what is ufw actually doing here?
+#
+#   - It protects host services that Docker does not publish — SSH above all.
+#   - It documents intent, which matters when someone else reads this repo.
+#   - It is the correct tool the moment a port stops being Docker-published.
+#
+# What it is NOT doing is protecting the Wazuh containers. On this lab's NAT
+# network that is acceptable: nothing outside the hypervisor can route to
+# 192.168.140.0/24 at all, so the network boundary is the real control.
+#
+# On a VPS this is not acceptable. Fix it there with one of:
+#   - bind published ports to 127.0.0.1 and reach them through an SSH tunnel or
+#     a reverse proxy (`ports: "127.0.0.1:443:5601"`);
+#   - set `"iptables": false` in /etc/docker/daemon.json and write the forward
+#     rules yourself (understand the consequences first);
+#   - use the ufw-docker helper, which inserts rules into DOCKER-USER.
+#
+# See docs/PORTING-TO-VPS.md.
+# =============================================================================
+
+- name: Install ufw
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+- name: Allow SSH before anything else
+  # Order matters. Enabling a default-deny policy before the SSH rule exists
+  # locks you out of the host mid-play, and the play is running over SSH.
+  community.general.ufw:
+    rule: allow
+    port: "22"
+    proto: tcp
+    comment: SSH
+
+# Written out rather than looped. `policy` is a fixed-choice argument, and
+# passing it a templated value defeats ansible-lint's argument validation
+# (args[module]) for no benefit — there are exactly two directions and they take
+# different policies.
+- name: Deny inbound traffic by default
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+- name: Allow outbound traffic by default
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+
+- name: Allow the Wazuh service ports
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto }}"
+    comment: "{{ item.comment }}"
+  loop: "{{ common_firewall_rules }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto }} ({{ item.comment }})"
+
+- name: Allow the indexer port
+  # `| default(false)` because this variable belongs to the Wazuh stack, not to
+  # this role. Depending on a group_var that a caller might not have set is how a
+  # role becomes impossible to run in isolation.
+  community.general.ufw:
+    rule: "{{ 'allow' if wazuh_expose_indexer | default(false) | bool else 'deny' }}"
+    port: "9200"
+    proto: tcp
+    comment: Wazuh indexer HTTP
+
+# ---------------------------------------------------------------------------
+# WireGuard overlay
+# ---------------------------------------------------------------------------
+# The one port a remote agent needs reachable. Everything else can stay closed — which
+# is the whole argument for the overlay: expose 51820/udp and never 1514, 1515, 443
+# or 9200.
+- name: Allow the WireGuard port
+  # Gated on LISTENING, not on being the hub.
+  #
+  # Those are the same thing only in the default topology. When the manager sits behind
+  # NAT with no reachable endpoint, the direction inverts: the spokes listen and the hub
+  # dials out. Keying this on `wireguard_role == 'hub'` would then open the port on the
+  # one host that does not need it and leave it closed on the ones that do.
+  community.general.ufw:
+    rule: allow
+    port: "{{ wireguard_port | default(51820) }}"
+    proto: udp
+    comment: WireGuard overlay
+  when: wireguard_listen | default(false) | bool
+
+- name: Allow traffic on the WireGuard interface
+  # Any host with a tunnel needs to accept traffic arriving on it, whichever end dialled.
+  community.general.ufw:
+    rule: allow
+    interface: "{{ wireguard_interface | default('wg0') }}"
+    direction: in
+    comment: WireGuard overlay
+  when: wireguard_address | default('') | length > 0
+
+- name: Enable ufw
+  community.general.ufw:
+    state: enabled
+    logging: "on"
+
+- name: Restrict the Docker-published agent ports to the overlay
+  ansible.builtin.import_tasks: docker_firewall.yml
+  when:
+    - common_manage_docker_firewall | default(true) | bool
+    - wireguard_role | default('') == 'hub'
+  tags: [docker-firewall]

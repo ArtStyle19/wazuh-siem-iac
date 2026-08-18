@@ -1,0 +1,54 @@
+---
+# Order is load-bearing:
+#
+#   config     writes everything except internal_users.yml
+#   certs      generates the TLS bundle the containers mount
+#   passwords  hashes the vault passwords into internal_users.yml
+#   deploy     first start of the containers
+#
+# passwords MUST precede deploy. The indexer reads internal_users.yml only while
+# initialising its security index on first boot (allow_default_init_securityindex
+# is true); after that the file is ignored and changing credentials needs
+# securityadmin.sh.
+
+- name: Create the deployment directories
+  ansible.builtin.import_tasks: directories.yml
+
+- name: Deploy configuration files
+  ansible.builtin.import_tasks: config.yml
+  tags: [config]
+
+- name: Generate TLS certificates
+  ansible.builtin.import_tasks: certs.yml
+  tags: [certs]
+
+- name: Configure credentials
+  ansible.builtin.import_tasks: passwords.yml
+  tags: [passwords]
+
+- name: Start the stack
+  ansible.builtin.import_tasks: deploy.yml
+  tags: [deploy]
+
+- name: Rotate indexer credentials on a running cluster
+  ansible.builtin.import_tasks: rotate.yml
+  when: wazuh_force_password_rotation | bool
+  tags: [rotate]
+
+- name: Verify the deployment
+  ansible.builtin.import_tasks: verify.yml
+  tags: [verify]
+
+# After verify for the same reason as agent_groups: it validates with
+# `wazuh-analysisd -t` inside the container, so it needs a running manager.
+# Before agent_groups because the rules must exist by the time agents start sending the
+# events that trigger them.
+- name: Deploy custom rules and decoders
+  ansible.builtin.import_tasks: custom_rules.yml
+  tags: [custom-rules]
+
+# After verify, because it talks to a running manager over `docker exec`. Ordering
+# it earlier would mean racing the manager's startup for no reason.
+- name: Configure agent groups and their shared configuration
+  ansible.builtin.import_tasks: agent_groups.yml
+  tags: [agent-groups]

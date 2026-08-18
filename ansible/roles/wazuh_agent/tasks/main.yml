@@ -1,0 +1,150 @@
+---
+# =============================================================================
+# Wazuh agent
+# =============================================================================
+# Installs and enrols an agent on Debian/Ubuntu or RHEL/Fedora. The agent is
+# what makes the server worth running: without one, the dashboard is an empty
+# SIEM.
+#
+# Enrolment happens through WAZUH_MANAGER, read by the package's post-install
+# script, which registers with the manager over port 1515 and writes the address
+# into ossec.conf. The `replace` task afterwards is what makes re-runs
+# idempotent and lets you repoint an existing agent at a new manager.
+# =============================================================================
+
+- name: Require a supported OS family
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family in ['Debian', 'RedHat']
+    fail_msg: >-
+      This role supports Debian and RedHat families. This host reports
+      {{ ansible_os_family }} ({{ ansible_distribution }}).
+
+- name: Install the agent on Debian family
+  ansible.builtin.import_tasks: debian.yml
+  when: ansible_os_family == 'Debian'
+
+- name: Install the agent on RedHat family
+  ansible.builtin.import_tasks: redhat.yml
+  when: ansible_os_family == 'RedHat'
+
+# ---------------------------------------------------------------------------
+# Enrolment
+# ---------------------------------------------------------------------------
+
+# =============================================================================
+# Pointing the agent at the manager
+# =============================================================================
+# Two things here are easy to get wrong, and both were:
+#
+# 1. USE \g<1>, NEVER \1, WHEN THE REPLACEMENT STARTS WITH A DIGIT.
+#
+#    `replace: '\1{{ wazuh_manager_address }}\2'` renders to
+#    `\1192.168.140.10\2`. Python's re engine then reads `\11` as GROUP 11:
+#
+#        re.PatternError: invalid group reference 11 at position 1
+#
+#    An IP address and a port both always start with a digit, so this failed on
+#    every host, every run — not an edge case. `\g<1>` delimits the group number
+#    explicitly and is the correct form whenever the following character could be
+#    read as part of the reference.
+#
+# 2. SCOPE THE REPLACEMENT. `(<port>)[^<]*(</port>)` matches every <port> element
+#    in ossec.conf, not just the manager's. `after`/`before` confine the edit to
+#    the <server> block, so an unrelated <port> elsewhere in the file is not
+#    rewritten to 1514.
+#
+# Because a non-matching `after`/`before` makes `replace` a silent no-op — leaving
+# the agent pointed at whatever it had before — the assertion after these tasks
+# turns that silence into a failure.
+
+- name: Point the agent at the manager
+  # The postinst only sets this on a fresh install. Setting it here means the
+  # role converges whether the agent is new, already installed, or pointing at
+  # a manager whose address changed.
+  ansible.builtin.replace:
+    path: /var/ossec/etc/ossec.conf
+    after: '<server>'
+    before: '</server>'
+    regexp: '(<address>)[^<]*(</address>)'
+    replace: '\g<1>{{ wazuh_manager_address }}\g<2>'
+  notify: Restart wazuh-agent
+
+- name: Set the manager's port
+  ansible.builtin.replace:
+    path: /var/ossec/etc/ossec.conf
+    after: '<server>'
+    before: '</server>'
+    regexp: '(<port>)[^<]*(</port>)'
+    replace: '\g<1>{{ wazuh_agent_comm_port }}\g<2>'
+  notify: Restart wazuh-agent
+
+- name: Confirm the agent really points at the manager
+  # `replace` reports changed=false both when the file is already correct and when
+  # its pattern matched nothing. Those mean opposite things, so verify the outcome
+  # rather than trusting the task result.
+  ansible.builtin.slurp:
+    src: /var/ossec/etc/ossec.conf
+  register: wazuh_agent_ossec_conf
+
+- name: Fail if the manager address was not applied
+  ansible.builtin.assert:
+    that:
+      - "'<address>' ~ wazuh_manager_address ~ '</address>' in (wazuh_agent_ossec_conf.content | b64decode)"
+    fail_msg: >-
+      /var/ossec/etc/ossec.conf does not contain
+      <address>{{ wazuh_manager_address }}</address>.
+
+      The replace task matched nothing, which usually means the <server> block in
+      this agent's ossec.conf has an unexpected shape. Inspect it with:
+        sudo sed -n '/<client>/,/<\/client>/p' /var/ossec/etc/ossec.conf
+    success_msg: "Agent points at {{ wazuh_manager_address }}."
+
+- name: Enable and start the agent
+  ansible.builtin.systemd_service:
+    name: wazuh-agent
+    state: started
+    enabled: true
+    daemon_reload: true
+
+# ---------------------------------------------------------------------------
+# Confirm it actually connected
+# ---------------------------------------------------------------------------
+
+- name: Flush handlers so the agent restarts before we check it
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for the agent to reach the manager
+  ansible.builtin.command: /var/ossec/bin/wazuh-control status
+  register: wazuh_agent_status
+  changed_when: false
+  until: "'wazuh-agentd is running' in wazuh_agent_status.stdout"
+  retries: 12
+  delay: 5
+
+- name: Confirm the manager accepted the connection
+  # "Connected to the server" in the agent's own log is the only local proof
+  # that enrolment succeeded. A running agentd that never connected looks
+  # identical from systemd's point of view.
+  ansible.builtin.command:
+    argv:
+      - grep
+      - -c
+      - "Connected to the server"
+      - /var/ossec/logs/ossec.log
+  register: wazuh_agent_connected
+  changed_when: false
+  failed_when: false
+  retries: 12
+  delay: 5
+  until: wazuh_agent_connected.rc == 0
+
+- name: Report enrolment result
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: agent {{ wazuh_agent_version }} running and
+      {{ 'connected to' if wazuh_agent_connected.rc == 0 else 'NOT YET connected to' }}
+      {{ wazuh_manager_address }}:{{ wazuh_agent_comm_port }}.
+      {{ 'Check it appears under Endpoints in the dashboard.'
+         if wazuh_agent_connected.rc == 0
+         else 'Inspect /var/ossec/logs/ossec.log on this host.' }}

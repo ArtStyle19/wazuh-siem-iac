@@ -1,0 +1,77 @@
+---
+# =============================================================================
+# Check that the rules COMPILE, not that the file exists
+# =============================================================================
+# A .yar with a syntax error copies perfectly and then fails on every scan, silently,
+# inside active response — where nobody is looking. Deployment is the only sensible moment
+# to find out.
+#
+# Compilation is forced by scanning /dev/null: that makes yara parse every rule and return
+# non-zero if any fails, without needing a test file.
+# =============================================================================
+
+- name: Confirm the YARA binary works
+  ansible.builtin.command:
+    cmd: yara --version
+  register: yara_version
+  changed_when: false
+  check_mode: false
+
+- name: Compile-check the rule index
+  # The index rather than the individual files: it is the artefact the scripts actually
+  # use at runtime, so it is the only one whose compiling proves anything. Checking the
+  # pieces separately would let an `include` with a wrong path through.
+  ansible.builtin.command:
+    cmd: "yara --fail-on-warnings {{ yara_dir }}/index.yar /dev/null"
+  register: yara_index_compile
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Compile-check the local rule overlay
+  # Each file separately: if one fails, the message names it. Compiling them together would
+  # give an error without saying where it came from.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      rc=0;
+      for f in {{ yara_local_rules_dir }}/*.yar; do
+        [ -e "$f" ] || continue;
+        yara --fail-on-warnings "$f" /dev/null >/dev/null 2>&1 || {
+          echo "FAILS: $f"; rc=1;
+        };
+      done;
+      exit $rc
+    executable: /bin/bash
+  register: yara_local_compile
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require every rule file to compile
+  ansible.builtin.assert:
+    that:
+      - yara_index_compile.rc == 0
+      - yara_local_compile.rc == 0
+    fail_msg: >-
+      YARA rules do not compile on {{ inventory_hostname }}
+      (yara {{ yara_version.stdout | default('?') | trim }}).
+
+      Index ({{ yara_dir }}/index.yar): rc={{ yara_index_compile.rc }}
+      {{ yara_index_compile.stderr | default('') | truncate(400) }}
+
+      Own rules: rc={{ yara_local_compile.rc }}
+      {{ yara_local_compile.stdout | default('') | truncate(400) }}
+
+      If the public set fails, the pinned commit is not compatible with this version of
+      yara; try a different yara_rules_commit. If the local rules fail, the error is in
+      the file named above.
+    quiet: true
+
+- name: Report what is armed
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: yara {{ yara_version.stdout | trim }},
+      index compiles ({{ yara_local_found.files | length }} own rules),
+      scanning limited to {{ yara_scan_paths | join(', ') }},
+      ceiling {{ yara_max_file_size_kb }} KB, timeout {{ yara_scan_timeout }}s.

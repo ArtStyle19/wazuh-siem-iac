@@ -1,0 +1,45 @@
+# =============================================================================
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+# =============================================================================
+#   cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+#
+# Every value below is a default from variables.tf — the file exists so you can
+# see the knobs in one place, not because anything here is required.
+# =============================================================================
+
+# ---- Hypervisor -------------------------------------------------------------
+libvirt_uri  = "qemu:///system"
+storage_pool = "vm-images"
+
+# ---- Virtual machine --------------------------------------------------------
+vm_name = "wazuh-server"
+
+# 4096 is Wazuh's floor and validated as such. Raise to 6144 if the host can
+# spare it — check with `make preflight` first.
+vm_memory_mib = 4096
+vm_vcpu       = 2
+vm_disk_gib   = 30
+
+# ---- Network ----------------------------------------------------------------
+# Must not overlap 192.168.122.0/24 (libvirt's default network) or your LAN.
+network_cidr       = "192.168.140.0/24"
+network_host_index = 10 # -> 192.168.140.10
+dns_domain         = "lab.local"
+
+# ---- Access -----------------------------------------------------------------
+# The account cloud-init creates at first boot. It only ever runs once, so changing this
+# on a live VM has no effect on the guest — it is fixed until you rebuild.
+admin_username = "admin"
+
+# The account Ansible connects as. Separate on purpose, so the automation account can be
+# rotated on a running host: `make bootstrap` creates it, this points at it, and the old
+# one is retired with `bootstrap_revoke_users`. Leave unset to reuse admin_username.
+ansible_user = "wazuh-ansible"
+
+ssh_public_key_path  = "~/.ssh/id_ed25519.pub"
+ssh_private_key_path = "~/.ssh/id_ed25519"
+timezone             = "America/Lima"
+
+# ---- Wazuh ------------------------------------------------------------------
+# Exact version, never a floating tag. 5.0.0-* on Docker Hub are betas.
+wazuh_version = "4.14.7"

@@ -1,0 +1,78 @@
+---
+# =============================================================================
+# Deploy the Wazuh SIEM server
+# =============================================================================
+#   make configure          (wraps: ansible-playbook site.yml --ask-vault-pass)
+#
+# Idempotent: a second run should report changed=0. If it does not, something in
+# a role is rewriting a file it should have left alone.
+# =============================================================================
+
+- name: Deploy Wazuh single-node stack
+  hosts: wazuh_servers
+  become: true
+
+  # Deferred until the host is actually reachable. Gathering facts as the first
+  # thing a play does is what turns "the VM is still booting" into an opaque
+  # UNREACHABLE error.
+  gather_facts: false
+
+  # Tagged `always` so they run under any --tags selection.
+  #
+  # Without it, `--tags common` (or verify, or wazuh) skips fact gathering, and the first
+  # task that reads a fact dies with "'ansible_default_ipv4' is undefined" — which reads
+  # like a broken role rather than a missing prerequisite. Connectivity and facts are
+  # preconditions for every tag, not a phase of one.
+  pre_tasks:
+    - name: Wait for SSH to accept connections
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        sleep: 5
+      become: false
+      tags: [always]
+
+    # cloud-init is still installing packages when sshd first answers. Racing it
+    # means fighting over /var/lib/dpkg/lock and failing at random.
+    - name: Wait for cloud-init to finish
+      ansible.builtin.raw: cloud-init status --wait
+      register: cloud_init_status
+      changed_when: false
+      # 0 = done, 2 = done with recoverable warnings. 1 is a genuine failure.
+      failed_when: cloud_init_status.rc not in [0, 2]
+      tags: [always]
+
+    - name: Gather facts
+      ansible.builtin.setup:
+      tags: [always]
+
+    - name: Assert the guest has enough memory for Wazuh
+      ansible.builtin.assert:
+        that:
+          - ansible_memtotal_mb >= 3700
+        fail_msg: >-
+          This host reports only {{ ansible_memtotal_mb }} MiB of RAM. Wazuh's
+          all-in-one deployment needs 4 GiB; the indexer will be OOM-killed
+          below that. Raise vm_memory_mib and re-apply.
+        success_msg: "{{ ansible_memtotal_mb }} MiB RAM available."
+      tags: [always]
+
+  roles:
+    - role: common
+      tags: [common]
+
+    # The `wireguard` role is deliberately NOT here.
+    #
+    # Building the overlay needs the hub and every spoke in the SAME play: each end
+    # templates its config from the others' public keys via hostvars. This play
+    # targets wazuh_servers only, so the hub would compute an empty peer list and
+    # write a config that connects to nothing.
+    #
+    # The overlay is built by the mesh play in agent.yml (`make tunnel`) — which is
+    # also the right moment for it, since an overlay exists to serve remote agents and
+    # can be created when the first one is enrolled.
+
+    - role: docker
+      tags: [docker]
+
+    - role: wazuh_stack
+      tags: [wazuh]

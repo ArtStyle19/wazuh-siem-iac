@@ -1,0 +1,36 @@
+---
+# =============================================================================
+# ansible-lint
+# =============================================================================
+#   cd ansible && ansible-lint
+#
+# Run from the ansible/ directory so ansible.cfg is picked up and roles resolve.
+# =============================================================================
+
+profile: production
+
+exclude_paths:
+  - .cache/
+  - collections/
+  - inventory/hosts.ini
+
+# Jinja templates for non-YAML targets (ossec.conf is XML) are not lintable as
+# playbook content.
+kinds:
+  - jinja2: "**/templates/*.j2"
+
+skip_list:
+  # The vault file is created by `make vault-init` on a fresh clone rather than
+  # committed pre-filled, so linting cannot resolve the variables it defines.
+  - var-naming[no-role-prefix]
+
+warn_list:
+  # Informational only: reported so the coupling stays visible, not enforced.
+  - experimental
+
+# Verify these are installed with `make deps`.
+enable_list:
+  - args
+  - empty-string-compare
+  - no-log-password
+  - no-same-owner

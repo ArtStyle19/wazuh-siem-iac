@@ -1,0 +1,128 @@
+---
+# =============================================================================
+# Custom rules and decoders, with validation and rollback
+# =============================================================================
+# A malformed local_rules.xml stops wazuh-analysisd from starting, and then the manager
+# processes NOTHING: no alerts, no FIM, nothing. The failure arrives on the next restart,
+# which can be days after the deploy that caused it.
+#
+# Hence three barriers, in increasing order of cost:
+#   1. Well-formed XML, checked on the host before the file enters the container
+#   2. `wazuh-analysisd -t` inside the container, which validates the semantics: references
+#      to non-existent rules, unknown fields, invalid regexes
+#   3. Rollback if 2 fails — the files are withdrawn so the manager can still start, and the
+#      task fails loudly
+#
+# Same principle as `validate: visudo --check` in roles/bootstrap: validate before
+# installing, at the only point where the error is dirt cheap to fix.
+# =============================================================================
+
+- name: Render the custom rules and decoders
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ wazuh_install_dir }}/custom-rules/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0640"
+  loop:
+    - { src: local_decoder.xml.j2, name: local_decoder.xml }
+    - { src: local_rules.xml.j2, name: local_rules.xml }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Check the rendered XML is well formed
+  # Barrier 1, on the host. An unclosed `<` or a badly escaped entity is caught here without
+  # touching the manager. python3 is guaranteed by roles/bootstrap.
+  #
+  # The files are NOT complete XML documents: they are fragments with several root elements,
+  # which is what Wazuh expects. That is why they are wrapped before parsing.
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import sys, xml.etree.ElementTree as ET
+        for path in sys.argv[1:]:
+            with open(path) as fh:
+                ET.fromstring("<wrapper>" + fh.read() + "</wrapper>")
+        print("ok")
+      - "{{ wazuh_install_dir }}/custom-rules/local_decoder.xml"
+      - "{{ wazuh_install_dir }}/custom-rules/local_rules.xml"
+  register: wazuh_custom_xml_check
+  changed_when: false
+  check_mode: false
+
+- name: Deploy the custom rules and decoders, validating before the manager restarts
+  block:
+    - name: Copy the custom decoders and rules into the manager
+      # uid/gid 999 and `mode_parse: octal_string_only` for the same reasons documented in
+      # agent_groups.yml: the `wazuh` user inside the image, and this module's `legacy` mode
+      # which would read "0640" as decimal 640.
+      community.docker.docker_container_copy_into:
+        container: wazuh.manager
+        path: "{{ wazuh_install_dir }}/custom-rules/{{ item.name }}"
+        container_path: "{{ item.dest }}"
+        owner_id: 999
+        group_id: 999
+        mode: "0640"
+        mode_parse: octal_string_only
+      loop:
+        - { name: local_decoder.xml, dest: /var/ossec/etc/decoders/local_decoder.xml }
+        - { name: local_rules.xml, dest: /var/ossec/etc/rules/local_rules.xml }
+      loop_control:
+        label: "{{ item.dest }}"
+      register: wazuh_custom_rules_copied
+
+    - name: Validate the ruleset with analysisd
+      # Barrier 2. `-t` loads the whole configuration and the complete ruleset without
+      # starting the service, so it catches what well-formed XML cannot: an `if_sid` pointing
+      # at a rule that does not exist, an unknown `field`, an invalid pcre2.
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - wazuh.manager
+          - /var/ossec/bin/wazuh-analysisd
+          - -t
+      register: wazuh_analysisd_test
+      changed_when: false
+      check_mode: false
+
+  rescue:
+    - name: Remove the rejected rules so the manager can still start
+      # Barrier 3. Without this, an invalid ruleset stays inside the container and the manager
+      # dies on its next restart — possibly days later, with no apparent connection to this
+      # deploy. The files are withdrawn and a startable state is restored.
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - wazuh.manager
+          - rm
+          - -f
+          - /var/ossec/etc/rules/local_rules.xml
+          - /var/ossec/etc/decoders/local_decoder.xml
+      changed_when: true
+
+    - name: Fail with what analysisd objected to
+      ansible.builtin.fail:
+        msg: >-
+          The custom ruleset does not validate, and it has been withdrawn from the manager so
+          it can still start. The manager keeps running with the factory ruleset.
+
+          Output of wazuh-analysisd -t:
+          {{ wazuh_analysisd_test.stderr | default(wazuh_analysisd_test.stdout)
+             | default('no output — check whether the container is running') }}
+
+          Fix roles/wazuh_stack/templates/local_rules.xml.j2 or
+          local_decoder.xml.j2 and run `make configure` again.
+
+- name: Restart the manager when the ruleset changed
+  # Notified only after validation passed. analysisd reads rules and decoders at startup and
+  # once only, so a change has no effect without a restart — but restarting with an invalid
+  # ruleset is precisely what the barriers prevent.
+  ansible.builtin.debug:
+    msg: "Custom ruleset validated and deployed; the manager will be restarted."
+  when: wazuh_custom_rules_copied is defined and wazuh_custom_rules_copied.changed
+  changed_when: wazuh_custom_rules_copied.changed
+  notify: Restart wazuh manager

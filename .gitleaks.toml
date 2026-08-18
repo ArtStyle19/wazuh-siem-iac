@@ -1,0 +1,41 @@
+# =============================================================================
+# gitleaks configuration
+# =============================================================================
+# Two allowlist entries, both narrow, both for the same reason: gitleaks flagged a
+# CI placeholder and a documented diagnostic command as secrets. Neither is one.
+#
+# The source lines were also rewritten so a fresh clone would not trip the scanner
+# at all -- but gitleaks scans HISTORY, and the findings are in a commit that is
+# already pushed. Fixing the working tree does not remove them from the past, so
+# without this file the security job fails forever on two false positives.
+#
+# The alternative was rewriting history with a force push. Rejected: rewriting
+# published history to silence a false positive costs more than it buys, and the
+# audit trail of what the repository actually contained is worth keeping.
+#
+# The entries are scoped to ONE rule and ONE file each, on purpose. A broad
+# allowlist -- a whole directory, or a rule disabled globally -- is how a scanner
+# stops finding the real thing. If you add an entry here, scope it the same way
+# and say what it is.
+# =============================================================================
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+CI placeholder for the Wazuh API password. The workflow writes throwaway values \
+for the variables the vault would normally provide, because --syntax-check needs \
+them defined and CI has no vault. It never authenticates anywhere.\
+"""
+targetRules = ["generic-api-key"]
+paths = ['''^\.github/workflows/ci\.yml$''']
+
+[[allowlists]]
+description = """
+Documented diagnostic command using curl -u. The current text reads the password \
+into a shell variable, but earlier revisions had a literal placeholder after the \
+colon, which the curl-auth-user rule matches.\
+"""
+targetRules = ["curl-auth-user"]
+paths = ['''^docs/TROUBLESHOOTING\.md$''']

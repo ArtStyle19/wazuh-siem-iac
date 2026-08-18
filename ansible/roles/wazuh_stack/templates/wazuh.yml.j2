@@ -1,0 +1,37 @@
+# MANAGED BY ANSIBLE (role: wazuh_stack) — CONTAINS THE API PASSWORD.
+#
+# How the dashboard's Wazuh plugin reaches the manager's API. Without a working
+# entry here the dashboard loads but every Wazuh view is empty, which looks like
+# "no agents are reporting" rather than "the dashboard cannot authenticate".
+#
+# THE KEY `1513629884013` IS NOT DECORATIVE. DO NOT RENAME IT.
+#
+# The dashboard image runs /wazuh_app_config.sh on every start, and its entire
+# idempotence check is a literal grep:
+#
+#     grep -q 1513629884013 .../data/wazuh/config/wazuh.yml
+#     if [[ $? -ne 0 ]]; then  cat <<EOF >> $dashboard_config_file   # appends hosts:
+#
+# If that string is absent, the script APPENDS its own `hosts:` block. Because this
+# file is bind-mounted read-write, the append lands on the VM's copy and persists.
+#
+# The result is a document with two `hosts:` keys, which the Wazuh plugin refuses
+# to parse:
+#
+#     Error getting configuration: duplicated mapping key (18:1)
+#
+# The dashboard still starts and you can still log in — only the Wazuh views break,
+# presenting as an empty Agents list. This project used a friendlier key (`default:`)
+# at first and hit exactly that.
+#
+# So the magic number stays. Matching upstream's sentinel is what makes this file
+# authoritative rather than appended-to.
+hosts:
+  - 1513629884013:
+      url: "https://wazuh.manager"
+      port: 55000
+      username: {{ wazuh_api_username }}
+      password: "{{ wazuh_api_password }}"
+      # Use the permissions of the authenticated user rather than the API
+      # account's own, so dashboard RBAC means something.
+      run_as: true

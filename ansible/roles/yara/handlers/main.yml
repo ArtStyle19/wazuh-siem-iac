@@ -1,0 +1,9 @@
+---
+- name: Restart wazuh agent to pick up the sweep log
+  # Only when the log file has just been created. logcollector opens its files at start;
+  # one that appears afterwards stays out until the next restart, and the result is a sweep
+  # that works without anyone seeing anything — the worst kind of failure.
+  ansible.builtin.systemd_service:
+    name: wazuh-agent
+    state: restarted
+  when: yara_sweep_log_created.changed | default(false)

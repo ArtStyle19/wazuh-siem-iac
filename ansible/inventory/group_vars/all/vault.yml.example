@@ -1,0 +1,46 @@
+---
+# =============================================================================
+# TEMPLATE. Do not put real passwords here and do not commit a filled-in copy.
+# =============================================================================
+#
+# Generate the real, encrypted vault.yml with strong random values:
+#
+#     make vault-init
+#
+# That target writes inventory/group_vars/all/vault.yml, encrypted with
+# ansible-vault, and prompts you for the vault password. **That file is
+# gitignored** — this repository is public, and publishing ciphertext means
+# publishing an offline attack target forever. Only this example is committed.
+# See the .gitignore entry for the full reasoning.
+#
+# To inspect or change it later:
+#
+#     make vault-show      # decrypt to stdout
+#     make vault-edit      # open in $EDITOR, re-encrypt on save
+#
+# ---- Password rules that will bite you --------------------------------------
+#
+#   wazuh_api_password  The Wazuh server API enforces complexity: 8-64
+#                       characters with at least one uppercase, one lowercase,
+#                       one digit and one symbol. A password that fails this is
+#                       silently rejected and the dashboard cannot reach the
+#                       API, which presents as an empty Agents view.
+#
+#   indexer/dashboard   Avoid `$` and backticks. These end up inside a compose
+#                       file and a YAML document; `$` there invites shell and
+#                       Compose variable interpolation.
+#
+#   cluster_key         32 hexadecimal characters. Unused while the manager runs
+#                       single-node, but shipping upstream's demo key is the
+#                       kind of thing a security review flags.
+#
+# There is deliberately NO overlay credential here. The WireGuard private keys are
+# generated on each host and never leave it; only public keys are exchanged. See
+# roles/wireguard/tasks/keys.yml.
+#
+# =============================================================================
+
+vault_wazuh_indexer_password: "REPLACE_ME_indexer"
+vault_wazuh_dashboard_password: "REPLACE_ME_dashboard"
+vault_wazuh_api_password: "REPLACE_ME_Api1!"
+vault_wazuh_cluster_key: "REPLACE_ME_32_hex_characters_here"

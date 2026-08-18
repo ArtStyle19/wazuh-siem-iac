@@ -1,0 +1,52 @@
+---
+# =============================================================================
+# Dependabot
+# =============================================================================
+# Keeps the pinned versions honest. This project pins deliberately — the libvirt
+# provider to ~> 0.9.8, Wazuh to an exact 4.14.7, GitHub Actions to major tags —
+# and the cost of pinning is that nothing tells you when a pin has gone stale.
+# Dependabot is what pays that cost.
+#
+# What it cannot see: `wazuh_version` in Terraform and Ansible. Those are plain
+# strings in HCL and YAML, not a dependency manifest, so Wazuh upgrades stay a
+# manual decision. That is arguably correct for a SIEM — read the release notes
+# before moving a security platform.
+# =============================================================================
+
+version: 2
+updates:
+  - package-ecosystem: terraform
+    directory: /terraform
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - terraform
+
+  # The reusable module has its own required_providers block, so it needs its own
+  # entry — Dependabot does not recurse into subdirectories.
+  - package-ecosystem: terraform
+    directory: /terraform/modules/libvirt-vm
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - terraform
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - dependencies
+      - github-actions

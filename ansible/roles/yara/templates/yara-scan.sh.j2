@@ -1,0 +1,199 @@
+#!/bin/sh
+# =============================================================================
+# MANAGED BY ANSIBLE (role: yara). Do not edit on the host.
+# =============================================================================
+# On-demand or scheduled YARA sweep.
+#
+# WHY IT EXISTS, on top of the active response script:
+#
+# The active response only fires when FIM detects a change, so it never sees the files that
+# were ALREADY on disk when the agent was installed. On a host compromised before Wazuh went
+# in — the case that motivated this — that means the malware sits in FIM's baseline and no
+# alert ever
+# mentions it. This sweep covers exactly that gap: it looks at what IS there, not at what
+# changes.
+#
+# It writes with the SAME format as yara.sh, so it reuses the decoder and rules already on
+# the manager and matches show up as level 12 alerts in the dashboard. Nothing new is needed
+# on the manager side.
+#
+# Usage:
+#   yara-scan.sh                 sweeps the configured default paths
+#   yara-scan.sh /lib /usr/bin   sweeps only those
+# =============================================================================
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+RULES_INDEX="{{ yara_dir }}/index.yar"
+# ITS OWN log, not active-responses.log. That file is already collected by the agent's local
+# configuration and declaring it twice makes logcollector drop one declaration; it is also
+# the active response audit trail, and on a compromised host that is evidence.
+LOG="{{ yara_sweep_log }}"
+LOCK="{{ yara_dir }}/.sweep.lock"
+MAX_KB="{{ yara_max_file_size_kb }}"
+TIMEOUT="{{ yara_sweep_timeout }}"   # TOTAL budget for the sweep, not per file
+
+log() { printf '%s\n' "wazuh-yara: $1" >> "$LOG" 2>/dev/null; }
+
+# Paths from the arguments, or the configured list.
+if [ "$#" -gt 0 ]; then
+    TARGETS="$*"
+else
+    TARGETS="{{ yara_scan_paths | map('quote') | join(' ') }}"
+fi
+
+if ! command -v yara >/dev/null 2>&1; then
+    log "ERROR - yara is not installed; the sweep did not run"
+    exit 1
+fi
+if [ ! -r "$RULES_INDEX" ]; then
+    log "ERROR - cannot read ${RULES_INDEX}; the sweep did not run"
+    exit 1
+fi
+
+# Its own mutual exclusion, separate from the active response script's: a sweep runs for
+# minutes and must not block the point scans of a newly created file, nor overlap with
+# another sweep if someone launches it twice or the schedule fires early.
+exec 9>"$LOCK" 2>/dev/null || exit 1
+if ! flock -n 9 2>/dev/null; then
+    log "INFO - Sweep skipped: another sweep already running"
+    exit 0
+fi
+
+# RESOLVE SYMLINKS AND DEDUPLICATE, and this is load-bearing on any modern distro.
+#
+# On merged-/usr systems — Ubuntu 24.04, Debian 12, Fedora — /lib, /bin and /sbin are
+# SYMLINKS to /usr/lib, /usr/bin and /usr/sbin. `find` does not follow symlinks by default,
+# so `find /lib -type f` returns NOTHING and the sweep reports "0 files scanned" about a
+# directory full of files. Verified in practice: sweep of /lib = 0 files, with /lib/libudev.so
+# present and detectable.
+#
+# Resolving with `readlink -f` turns /lib into /usr/lib. And deduplicating is necessary
+# because then /lib and /usr/lib are the same path: without it everything gets scanned twice.
+RESOLVED=""
+for target in $TARGETS; do
+    [ -e "$target" ] || continue
+    real=$(readlink -f "$target" 2>/dev/null) || continue
+    case " $RESOLVED " in
+        *" $real "*) continue ;;
+    esac
+    RESOLVED="$RESOLVED $real"
+done
+
+log "INFO - Sweep started on:${RESOLVED}"
+
+# ONE single yara invocation with --scan-list, NOT one per file.
+#
+# The first version did `for f in $(find ...); do yara ... "$f"; done`, and every invocation
+# recompiles the 902 rules. Measured on a real host: a sweep of /usr/lib took over ten minutes and
+# was still going. With --scan-list yara compiles once and walks the list, so the cost goes
+# from "one compile per file" to "one compile".
+#
+# `find` is still used to filter by size, something yara alone cannot do: `-r` would walk the
+# tree but without excluding huge files.
+LIST="{{ yara_dir }}/.sweep-list"
+: > "$LIST" 2>/dev/null || { log "ERROR - cannot write ${LIST}"; exit 1; }
+
+for target in $RESOLVED; do
+    find "$target" -xdev -type f -size -"${MAX_KB}"k 2>/dev/null
+done | sort -u > "$LIST"
+
+SCANNED=$(wc -l < "$LIST" 2>/dev/null | tr -d ' ')
+[ -n "$SCANNED" ] || SCANNED=0
+
+if [ "$SCANNED" -eq 0 ]; then
+    log "INFO - Sweep finished: 0 files scanned, 0 with matches"
+    rm -f "$LIST"
+    exit 0
+fi
+
+# `nice`/`ionice` because this reads thousands of files: on a loaded server it is the
+# difference between a sweep you notice and one you do not.
+MATCHES=$(nice -n 19 ionice -c3 timeout "$TIMEOUT" \
+          yara -w --scan-list "$RULES_INDEX" "$LIST" 2>/dev/null)
+RC=$?
+rm -f "$LIST"
+
+if [ "$RC" -eq 124 ]; then
+    log "INFO - Sweep timed out after ${TIMEOUT}s (${SCANNED} files listed); partial results"
+fi
+
+# yara prints "RuleName /path/to/file". The path can contain spaces, so the first field is
+# taken as the rule and ALL the rest as the path, instead of $2.
+FOUND=0
+if [ -n "$MATCHES" ]; then
+    FOUND=$(printf '%s\n' "$MATCHES" | grep -c . )
+    printf '%s\n' "$MATCHES" | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        rule=${line%% *}
+        file=${line#* }
+        [ -n "$rule" ] && [ -n "$file" ] || continue
+        log "INFO - Scan result: ${rule} ${file}"
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# RUNNING PROCESS SCAN — where live malware actually is
+# ---------------------------------------------------------------------------
+# A disk sweep does not see malware that deletes itself after execution: on the compromised
+# host five processes were running from a deleted /usr/bin binary that no longer existed in
+# the directory. But /proc/<pid>/exe still points at the inode while the process lives,
+# so it CAN be read and scanned through there.
+#
+# ONE single invocation with --scan-list, same as the disk. The first version of this
+# launched yara per process inside a loop and saturated the host's CPU until it starved the
+# Wazuh agent: it stopped sending events for half an hour. Compiling 902 rules hundreds of
+# times is not viable.
+#
+# Deduplicated by link target: five processes from the same deleted binary give the same
+# string, so it is scanned once and the first PID is reported. Without this, malware that
+# spawns twenty children produces twenty scans and twenty identical alerts.
+{% if yara_scan_processes | default(true) | bool %}
+PROC_LIST="{{ yara_dir }}/.sweep-proc-list"
+PROC_MAP="{{ yara_dir }}/.sweep-proc-map"
+: > "$PROC_LIST" 2>/dev/null
+: > "$PROC_MAP" 2>/dev/null
+
+for pid_dir in /proc/[0-9]*; do
+    pid=${pid_dir#/proc/}
+    exe=$(readlink "$pid_dir/exe" 2>/dev/null) || continue
+    [ -n "$exe" ] || continue
+    # Only one entry per distinct binary.
+    if ! grep -qxF "$exe" "$PROC_MAP" 2>/dev/null; then
+        printf '%s\n' "$exe" >> "$PROC_MAP"
+        printf '%s\n' "$pid_dir/exe" >> "$PROC_LIST"
+        # The mapping is kept so the real path and the PID can be reported, rather than a
+        # useless "/proc/1234/exe" that says nothing in the dashboard.
+        printf '%s\t%s\t%s\n' "$pid_dir/exe" "$pid" "$exe" >> "${PROC_MAP}.idx"
+    fi
+done
+
+PROC_COUNT=$(wc -l < "$PROC_LIST" 2>/dev/null | tr -d ' ')
+[ -n "$PROC_COUNT" ] || PROC_COUNT=0
+
+if [ "$PROC_COUNT" -gt 0 ]; then
+    PROC_MATCHES=$(nice -n 19 ionice -c3 timeout "$TIMEOUT" \
+                   yara -w --scan-list "$RULES_INDEX" "$PROC_LIST" 2>/dev/null)
+    if [ -n "$PROC_MATCHES" ]; then
+        printf '%s\n' "$PROC_MATCHES" | while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            rule=${line%% *}
+            procpath=${line#* }
+            # Translate /proc/<pid>/exe back to the real path and the PID.
+            info=$(awk -F'\t' -v k="$procpath" '$1==k {print $2"\t"$3; exit}' "${PROC_MAP}.idx" 2>/dev/null)
+            pid=$(printf '%s' "$info" | cut -f1)
+            realexe=$(printf '%s' "$info" | cut -f2)
+            [ -n "$realexe" ] || realexe="$procpath"
+            log "INFO - Memory scan result: ${rule} ${realexe} [pid ${pid:-?}]"
+        done
+    fi
+    log "INFO - Memory sweep: ${PROC_COUNT} distinct process binaries scanned"
+fi
+rm -f "$PROC_LIST" "$PROC_MAP" "${PROC_MAP}.idx"
+{% endif %}
+
+# A closing line always, even with no findings. It is the difference between "there is no
+# malware" and "the sweep never ran", which from the dashboard look identical.
+log "INFO - Sweep finished: ${SCANNED} files scanned, ${FOUND} with matches"
+exit 0

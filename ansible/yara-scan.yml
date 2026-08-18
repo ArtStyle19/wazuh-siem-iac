@@ -1,0 +1,24 @@
+---
+# =============================================================================
+# On-demand YARA sweep
+# =============================================================================
+#   make yara-scan HOSTS=<pattern>
+#   make yara-scan HOSTS=<pattern> PATHS="/lib /usr/bin"
+#
+# Finds what the active response cannot see: files that were ALREADY on disk before the agent
+# was installed. On a host compromised beforehand, FIM's baseline recorded the malware as
+# normal state and no alert mentions it; this brings it to light.
+# =============================================================================
+
+- name: Sweep hosts with YARA
+  hosts: "{{ target_hosts | default('wazuh_agents') }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    # import_role rather than a loose task block: it is what loads roles/yara/defaults.
+    - name: Run the YARA sweep
+      ansible.builtin.import_role:
+        name: yara
+        tasks_from: sweep
+      tags: [yara-scan]

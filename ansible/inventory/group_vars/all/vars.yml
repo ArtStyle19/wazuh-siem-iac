@@ -1,0 +1,57 @@
+---
+# =============================================================================
+# Non-secret variables. Committed in plaintext, safe to read in a pull request.
+# =============================================================================
+#
+# The `vault_`-prefixed indirection below is a deliberate convention, not
+# ceremony. Ansible cannot show you where an encrypted variable is used without
+# decrypting the file, so referencing vault variables exactly once — here —
+# means `grep vault_ vars.yml` is a complete inventory of your secrets, and the
+# rest of the codebase reads normal variable names.
+#
+# See vault.yml.example for how to create the encrypted half.
+# =============================================================================
+
+# ---- Secrets, dereferenced from the vault -----------------------------------
+wazuh_indexer_password: "{{ vault_wazuh_indexer_password }}"
+wazuh_dashboard_password: "{{ vault_wazuh_dashboard_password }}"
+wazuh_api_password: "{{ vault_wazuh_api_password }}"
+wazuh_cluster_key: "{{ vault_wazuh_cluster_key }}"
+
+# ---- Overlay network --------------------------------------------------------
+# WireGuard subnet for agents with no route to the manager.
+#
+# Note there is NO overlay secret in the vault. WireGuard private keys are generated
+# on each host by `wg genkey` and never leave it; only public keys are exchanged, as
+# inventory facts. That is a smaller attack surface than a shared enrolment token and
+# one less credential to rotate. See roles/wireguard/tasks/keys.yml.
+#
+# The subnet avoids this project's other networks deliberately: 192.168.140.0/24 is
+# the libvirt lab, and 172.17-19.0.0/16 are Docker's bridges on the manager. An
+# overlay that collides with a container bridge fails in a way that is very hard to
+# read — some flows work, some vanish.
+wireguard_subnet: "10.88.0.0/24"
+wireguard_port: 51820
+
+# ---- Host tuning ------------------------------------------------------------
+# 4 GiB is Wazuh's floor, and the indexer's JVM does not tolerate being paged
+# out. A swapfile is insurance against an OOM kill, not a substitute for RAM.
+common_swapfile_size_mb: 2048
+common_swappiness: 10
+
+common_manage_firewall: true
+common_install_unattended_upgrades: true
+
+# ---- Wazuh ------------------------------------------------------------------
+# wazuh_version arrives from the generated inventory so that a single Terraform
+# variable drives both layers. This default only applies if you run Ansible
+# against a hand-written inventory.
+wazuh_version: "4.14.7"
+
+wazuh_install_dir: /opt/wazuh
+
+# The indexer's HTTP port stays on the compose network. Nothing outside the VM
+# needs to talk OpenSearch directly, and publishing 9200 exposes an endpoint
+# whose only protection is a password you now have to rotate. Set true if you
+# want to query it from the host for debugging.
+wazuh_expose_indexer: false

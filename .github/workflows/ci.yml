@@ -1,0 +1,190 @@
+---
+name: CI
+
+# =============================================================================
+# What this pipeline can and cannot prove
+# =============================================================================
+# It proves the code is well-formed, internally consistent, idiomatic and free of
+# committed secrets. That is genuinely most of what breaks in an IaC repo.
+#
+# It does NOT prove the deployment works. GitHub's runners have no libvirt and no
+# KVM, so `terraform plan` and `apply` cannot run here — plan needs a live
+# hypervisor to refresh against. Only `make up` on a machine with libvirt
+# exercises the real path.
+#
+# That limit is stated rather than papered over. A green badge on a repo whose CI
+# silently skips the interesting half is worse than no badge.
+# =============================================================================
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, so a broken upstream (a moved provider version, a yanked collection)
+  # surfaces on a schedule rather than the next time you happen to push.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref — no value in linting a commit that has
+# already been replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to the version used locally. CI and the workstation disagreeing about
+  # the tool is a class of bug worth designing out, and `latest` means an upstream
+  # release can break the build on a commit that changed nothing.
+  TERRAFORM_VERSION: "1.15.8"
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          # We want the real CLI, not the wrapper that rewrites its output.
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform -chdir=terraform fmt -recursive -check -diff
+
+      - name: Init
+        # -backend=false is the important flag: CI must never touch state. It
+        # downloads providers so validate can typecheck, and nothing else.
+        run: terraform -chdir=terraform init -backend=false -input=false
+
+      - name: Validate
+        run: terraform -chdir=terraform validate -no-color
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: tflint
+        run: |
+          tflint --init --config="$(pwd)/.tflint.hcl"
+          tflint --chdir=terraform --recursive --config="$(pwd)/.tflint.hcl"
+
+  ansible:
+    name: Ansible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          # `cache: pip` hashes a dependency file to key the cache, and fails the
+          # step if it finds none. Pointing it at requirements-dev.txt is what
+          # makes the cache work; installing FROM that file is what stops an
+          # upstream ansible-lint release turning this build red on its own.
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Install collections
+        run: ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: yamllint
+        # .github/ included so the workflow file lints itself. Same argument list
+        # as `make lint`, so local and CI cannot drift apart.
+        run: yamllint -c .yamllint.yaml --strict ansible/ .pre-commit-config.yaml .github/
+
+      - name: ansible-lint
+        # Run from ansible/ so ansible.cfg applies and roles resolve, exactly as a
+        # human would run it.
+        working-directory: ansible
+        run: ansible-lint
+
+      - name: Syntax-check the playbooks
+        # No vault and no real inventory exist in CI, so supply throwaway values
+        # for the variables the vault would provide. --syntax-check does not
+        # connect anywhere; it parses and resolves modules, which is the part
+        # worth checking.
+        working-directory: ansible
+        run: |
+          cat > /tmp/ci-vars.yml <<'EOF'
+          vault_wazuh_indexer_password: "ci-placeholder"
+          vault_wazuh_dashboard_password: "ci-placeholder"
+          # Self-describing rather than something shaped like a password: a
+          # high-entropy string next to a variable named *_password is exactly
+          # what gitleaks flags, and a CI placeholder failing the security job is
+          # a false alarm that teaches people to ignore the scanner.
+          # --syntax-check never validates its format.
+          vault_wazuh_api_password: "ci-placeholder-api-password"
+          # Deliberately low-entropy and self-describing rather than 32 hex
+          # characters: paired with a variable name containing "key", a hex
+          # string of that length is exactly what secret scanners flag, and a
+          # CI placeholder failing the gitleaks job is a false alarm nobody
+          # thanks you for. --syntax-check never validates its format.
+          vault_wazuh_cluster_key: "ci-placeholder-cluster-key-00000"
+          EOF
+          printf '[wazuh_servers]\nci-host ansible_host=127.0.0.1\n' > /tmp/ci-inventory
+          ansible-playbook -i /tmp/ci-inventory site.yml      -e @/tmp/ci-vars.yml --syntax-check
+          ansible-playbook -i /tmp/ci-inventory agent.yml     -e @/tmp/ci-vars.yml --syntax-check
+          ansible-playbook -i /tmp/ci-inventory yara-scan.yml -e @/tmp/ci-vars.yml --syntax-check
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # gitleaks scans history, not just the tip, so it needs the full clone.
+          fetch-depth: 0
+
+      - name: gitleaks
+        # The binary directly rather than gitleaks/gitleaks-action@v2, for two
+        # reasons: the action requires a GITLEAKS_LICENSE for organisation-owned
+        # repositories, and it runs on the deprecated Node 20. A pinned download
+        # has neither problem and is one less third-party action with a token.
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          # --redact so a finding never prints the secret itself into a public log,
+          # which would publish it a second time. The path and rule are enough to
+          # act on.
+          /tmp/gitleaks git --no-banner --redact --verbose .
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+      - name: Assert no secrets or state are tracked
+        # A belt-and-braces check on .gitignore itself. If any of these ever
+        # appear in the index, the build fails loudly rather than the file
+        # quietly becoming public.
+        run: |
+          forbidden='
+          ansible/inventory/hosts
+          ansible/inventory/vps
+          ansible/inventory/group_vars/all/vault.yml
+          terraform/terraform.tfstate
+          '
+          fail=0
+          for f in $forbidden; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::$f is tracked by git and must not be"
+              fail=1
+            fi
+          done
+          if git ls-files | grep -E '\.tfstate|\.pem$|id_(rsa|ed25519)$'; then
+            echo "::error::state files or private keys are tracked"
+            fail=1
+          fi
+          exit "$fail"

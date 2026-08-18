@@ -1,0 +1,101 @@
+---
+- name: Install repository prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install Wazuh's repository signing key
+  # Dearmoured to a binary keyring: apt accepts either, but Wazuh's repository
+  # metadata is signed such that the .gpg form is what its own documentation
+  # uses, and matching that avoids surprises.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      curl -fsSL {{ wazuh_gpg_key_url }}
+      | gpg --dearmor --yes -o {{ wazuh_apt_keyring }}
+    creates: "{{ wazuh_apt_keyring }}"
+  args:
+    executable: /bin/bash
+
+- name: Make the keyring readable by _apt
+  ansible.builtin.file:
+    path: "{{ wazuh_apt_keyring }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure the Wazuh apt repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/wazuh.sources
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (role: wazuh_agent)
+      Types: deb
+      URIs: {{ wazuh_apt_repo_url }}
+      Suites: stable
+      Components: main
+      Signed-By: {{ wazuh_apt_keyring }}
+  register: wazuh_repo
+
+- name: Check whether the agent is already installed
+  # dpkg_selections below can only act on a package dpkg already knows about. On a
+  # host where wazuh-agent has never been installed it fails outright with
+  #   "Failed to find package 'wazuh-agent' to perform selection 'install'"
+  # so the unhold has to be conditional on the package existing.
+  ansible.builtin.command:
+    cmd: "dpkg-query -W -f='${Status}' wazuh-agent"
+  register: wazuh_agent_dpkg_status
+  changed_when: false
+  failed_when: false
+
+- name: Release any existing hold before installing
+  # apt refuses to change a held package even when asked explicitly, so without this
+  # bumping wazuh_agent_version fails on any host the role has already run against —
+  # the hold placed for good reasons becomes the thing that blocks the upgrade it was
+  # meant to make deliberate. Released here, re-applied after the install.
+  #
+  # Note the shape of the bug this task originally had, because it is the third
+  # instance in this project: a protective measure applied unconditionally, which then
+  # blocks the very action it protects. The dnf exclude did it by blocking reinstalls;
+  # this did it by failing on first install. A guard needs a condition.
+  ansible.builtin.dpkg_selections:
+    name: wazuh-agent
+    selection: install
+  when: "'install ok installed' in wazuh_agent_dpkg_status.stdout"
+
+- name: Install the Wazuh agent
+  ansible.builtin.apt:
+    name: "wazuh-agent={{ wazuh_agent_version }}-1"
+    state: present
+    # Refresh unconditionally. Tying this to `wazuh_repo.changed` — "did the repo file
+    # change during THIS run" — is the common idiom and it is subtly wrong: if an
+    # earlier run wrote the repo file and then failed before installing, the apt cache
+    # never learned about the repo. Every later run then sees an unchanged repo file,
+    # skips the update, and fails with
+    #     No package matching 'wazuh-agent' is available
+    # while the sources file sits on disk looking perfectly correct. The state that
+    # matters (the cache) is not the state being tested (the file).
+    update_cache: true
+  environment:
+    # Read by the package's post-install script, which registers the agent with
+    # the manager. Only effective on a fresh install — see the `replace` tasks
+    # in main.yml for the idempotent path.
+    WAZUH_MANAGER: "{{ wazuh_manager_address }}"
+    WAZUH_AGENT_NAME: "{{ wazuh_agent_name }}"
+    WAZUH_AGENT_GROUP: "{{ wazuh_agent_group }}"
+    WAZUH_REGISTRATION_SERVER: "{{ wazuh_manager_address }}"
+  notify: Restart wazuh-agent
+
+- name: Hold the agent at the pinned version
+  # Wazuh agents must never be newer than their manager. An unattended upgrade
+  # that bumps the agent past the server's version breaks the connection.
+  ansible.builtin.dpkg_selections:
+    name: wazuh-agent
+    selection: hold

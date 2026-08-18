@@ -1,0 +1,41 @@
+# Rendered by Terraform. Netplan v2 schema, consumed by cloud-init.
+#
+# Matching on MAC rather than an interface name keeps this correct regardless of how
+# the kernel decides to enumerate the PCIe bus, and set-name pins the result to a
+# predictable eth0.
+#
+# EVERY attached NIC must appear here. A libvirt interface with no matching stanza
+# comes up with no address at all — it looks connected in `virsh domiflist` and is
+# useless from inside the guest. That exact failure cost real debugging time on
+# another VM in this project.
+version: 2
+
+ethernets:
+  primary:
+    match:
+      macaddress: "${mac_address}"
+    set-name: eth0
+    dhcp4: true
+    dhcp6: false
+    # The address itself comes from the network's DHCP reservation, so it is stable
+    # without hard-coding static addressing into the guest.
+    dhcp4-overrides:
+      use-dns: true
+      use-domains: true
+%{ for idx, extra in extra_networks ~}
+
+  # ${extra.network}
+  extra${idx}:
+    match:
+      macaddress: "${extra.mac_address}"
+    set-name: eth${idx + 1}
+    dhcp4: true
+    dhcp6: false
+    dhcp4-overrides:
+      # use-routes: false by default — see the extra_networks variable. An auxiliary
+      # interface that installs a default route silently reroutes the machine's whole
+      # egress, and the symptom (traffic leaving by the wrong path) is invisible until
+      # something depends on the source address.
+      use-routes: ${extra.use_routes}
+      use-dns: ${extra.use_dns}
+%{ endfor ~}

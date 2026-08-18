@@ -1,0 +1,178 @@
+---
+# =============================================================================
+# Verify the tunnel carries traffic — not that the service started
+# =============================================================================
+# `systemctl is-active wg-quick@wg0` reports success for an interface that exists and
+# has never completed a handshake. WireGuard is silent by design: there is no "connect"
+# step and no error when a peer is unreachable, so a misconfigured tunnel looks
+# exactly like an idle one.
+#
+# This is the same distinction that cost hours earlier in this project, when a
+# container was reported `running` while unable to read its own config. Check the
+# outcome, not the mechanism.
+# =============================================================================
+
+- name: Read the interface state
+  ansible.builtin.command:
+    cmd: "wg show {{ wireguard_interface }} dump"
+  register: wireguard_dump
+  changed_when: false
+  # `wg show` only reads. Skipping it under --check leaves every check below comparing
+  # against an undefined value.
+  check_mode: false
+
+- name: Read the key the interface is actually using
+  # Checked FIRST, because without an identity nothing below can possibly pass, and the
+  # symptoms all point elsewhere.
+  #
+  # An interface can be up, addressed, and listing every peer while holding NO private
+  # key — `wg show` prints `(none)` for the public key and simply omits the key lines.
+  # `wg syncconf` against a config with no `PrivateKey` does exactly that, which is how
+  # a routine peer addition silently deprived this hub of its identity and cut off every
+  # agent. See handlers/main.yml.
+  #
+  # Comparing against this host's OWN public key rather than merely checking for
+  # non-empty also catches the worse case: a key that exists but is the wrong one, which
+  # every peer would reject while the interface looked perfectly healthy.
+  ansible.builtin.command:
+    cmd: "wg show {{ wireguard_interface }} public-key"
+  register: wireguard_iface_pubkey
+  changed_when: false
+  check_mode: false
+
+- name: Require the interface to hold this host's private key
+  ansible.builtin.assert:
+    that:
+      - wireguard_iface_pubkey.stdout | trim == wireguard_public_key
+    fail_msg: >-
+      {{ wireguard_interface }} on {{ inventory_hostname }} is not using this host's key.
+
+      Expected {{ wireguard_public_key }}
+      but the interface reports {{ wireguard_iface_pubkey.stdout | trim }}.
+
+      `(none)` means the interface has NO private key. The interface will still look
+      healthy — active, addressed, peers listed with old handshake times — but no
+      handshake can complete. Almost always `wg syncconf` was applied from a config
+      with no PrivateKey, which clears it. Recover with:
+        sudo wg set {{ wireguard_interface }} private-key {{ wireguard_dir }}/{{ wireguard_interface }}.key
+    quiet: true
+
+- name: Wait for a handshake with every peer
+  # Column 5 of `wg show <if> dump` is the last handshake as a unix timestamp; 0 means
+  # never. Retried because a spoke that has just brought its interface up may not have
+  # completed the exchange yet, and because the hub only learns a non-dialable spoke's
+  # endpoint when that spoke initiates.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      wg show {{ wireguard_interface }} dump | tail -n +2 | awk '$5 == 0 { print $1 }'
+    executable: /bin/bash
+  register: wireguard_no_handshake
+  check_mode: false
+  until: wireguard_no_handshake.stdout | trim | length == 0
+  retries: 12
+  delay: 5
+  changed_when: false
+  # Only the initiating side can force a handshake. A hub whose spokes dial in has
+  # nothing to do but wait, so its check is advisory.
+  failed_when: false
+
+- name: Report peers that never handshook
+  ansible.builtin.debug:
+    msg: >-
+      No handshake yet with {{ wireguard_no_handshake.stdout_lines | length }} peer(s).
+      On the hub this is normal until each spoke dials in. On a spoke it means the
+      underlay is blocked — check that {{ wireguard_peers
+      | selectattr('wireguard_endpoint', 'defined')
+      | map(attribute='wireguard_endpoint') | join(', ') | default('the hub endpoint', true) }}
+      is reachable by UDP from here.
+  when: wireguard_no_handshake.stdout | trim | length > 0
+
+- name: Wait for a handshake with every peer this host DIALS
+  # The strict check, and the distinction that matters in a mixed-direction mesh.
+  #
+  # A hub can dial some peers while waiting to be dialled by others — the manager dials
+  # a remote VPS but waits for a local spoke. Requiring a handshake with *every* peer
+  # would then fail the run whenever a local spoke happened to be offline, which is not
+  # a fault. Requiring one only with peers we dial is the honest condition: we
+  # initiated, so silence is a real failure.
+  #
+  # "Which peers do we dial" is read from the KERNEL rather than re-derived from the
+  # inventory. `wg show <if> dump` gives, per peer: 1=pubkey, 3=endpoint,
+  # 5=latest-handshake. So `$3 != "(none)" && $5 == 0` means "we have an address for
+  # this peer and have never completed a handshake with it" — which is exactly the
+  # failure, and nothing else.
+  #
+  # Reading live state also removes any chance of this check and the template
+  # disagreeing about who dials whom; there is one source of truth and it is the
+  # interface itself. A peer that dialled in shows a learned endpoint AND a handshake,
+  # so it never trips the test.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      wg show {{ wireguard_interface }} dump | tail -n +2
+      | awk '$3 != "(none)" && $5 == 0 { print $1 }'
+    executable: /bin/bash
+  register: wireguard_dialed_no_handshake
+  check_mode: false
+  until: wireguard_dialed_no_handshake.stdout | trim | length == 0
+  retries: 12
+  delay: 5
+  changed_when: false
+  failed_when: false
+
+- name: Require a working tunnel with the peers this host dials
+  ansible.builtin.assert:
+    that:
+      - wireguard_dialed_no_handshake.stdout | trim | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }} has an endpoint for
+      {{ wireguard_dialed_no_handshake.stdout_lines | length }} peer(s) but no handshake
+      after 60s. This host is the side that dials, so it is a real failure.
+
+      Almost always the UDP underlay is blocked. From this host:
+        nc -zvu <peer endpoint host> {{ wireguard_port }}
+
+      If that fails, the peer's endpoint is not reachable from here. Either open
+      {{ wireguard_port }}/udp on the peer, or invert the direction for it — set
+      wireguard_listen=true plus wireguard_endpoint on the PEER and
+      wireguard_hub_endpoint="" here. See roles/wireguard/defaults/main.yml.
+    quiet: true
+
+- name: Note whether this host dials anyone
+  # Used only to decide whether the reachability ping below is meaningful.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      wg show {{ wireguard_interface }} dump | tail -n +2
+      | awk '$3 != "(none)" { print $1 }'
+    executable: /bin/bash
+  register: wireguard_dialed_peers
+  changed_when: false
+  check_mode: false
+
+- name: Record whether this host initiates
+  ansible.builtin.set_fact:
+    wireguard_can_initiate: "{{ wireguard_dialed_peers.stdout | trim | length > 0 }}"
+
+- name: Confirm the overlay address answers
+  # The handshake proves keys and reachability. This proves the tunnel actually routes
+  # IP — the thing the Wazuh agent will depend on.
+  ansible.builtin.command:
+    cmd: "ping -c2 -W3 {{ (wireguard_peers | first).wireguard_address }}"
+  register: wireguard_ping
+  changed_when: false
+  check_mode: false
+  # Same reasoning as the assert above: only meaningful from the side that dialled.
+  # A passive listener pinging a peer that has not yet dialled in would simply fail.
+  when:
+    - wireguard_can_initiate | bool
+    - wireguard_peers | length > 0
+
+- name: Summarise the tunnel
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} {{ wireguard_address }} on {{ wireguard_interface }}:
+      {{ (wireguard_dump.stdout_lines | length) - 1 }} peer(s) configured{% if
+      wireguard_can_initiate | bool and wireguard_peers | length > 0 %},
+      {{ (wireguard_peers | first).wireguard_address }} reachable{% endif %}.

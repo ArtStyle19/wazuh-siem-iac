@@ -1,0 +1,21 @@
+---
+# Agent version tracks the manager's minor line. An agent may be older than its
+# manager but never newer, so pinning to the same version is the safe default.
+wazuh_agent_version: "{{ wazuh_version | default('4.14.7') }}"
+
+# Set from the Terraform-generated inventory, or with -e on the command line.
+wazuh_manager_address: ""
+wazuh_agent_enroll_port: 1515
+wazuh_agent_comm_port: 1514
+
+# Group the agent registers into. Groups are how you assign different rule sets
+# and file-integrity policies to different classes of host.
+wazuh_agent_group: default
+
+# Defaults to the target's own hostname, which is what you want almost always.
+wazuh_agent_name: "{{ ansible_hostname }}"
+
+wazuh_apt_repo_url: "https://packages.wazuh.com/4.x/apt"
+wazuh_yum_repo_url: "https://packages.wazuh.com/4.x/yum/"
+wazuh_gpg_key_url: "https://packages.wazuh.com/key/GPG-KEY-WAZUH"
+wazuh_apt_keyring: /usr/share/keyrings/wazuh.gpg

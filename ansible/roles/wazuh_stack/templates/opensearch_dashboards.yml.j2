@@ -1,0 +1,31 @@
+# MANAGED BY ANSIBLE (role: wazuh_stack)
+# Tracks upstream single-node v{{ wazuh_version }}.
+
+server.host: 0.0.0.0
+server.port: 5601
+
+# Service name on the compose network, resolved by Docker's embedded DNS.
+opensearch.hosts: https://wazuh.indexer:9200
+
+# `certificate` verifies the chain but not the hostname. Required here: the
+# indexer's certificate is issued for CN=wazuh.indexer by a private CA, and
+# hostname verification against a Docker service name is not meaningful.
+opensearch.ssl.verificationMode: certificate
+opensearch.requestHeadersWhitelist: ["securitytenant", "Authorization"]
+opensearch_security.multitenancy.enabled: false
+opensearch_security.readonly_mode.roles: ["kibana_read_only"]
+
+# Browser-facing TLS, signed by the same private CA. This is the certificate
+# your browser will complain about. On a VPS, terminate TLS in front of the
+# dashboard with a certificate from a real CA instead.
+server.ssl.enabled: true
+server.ssl.key: "/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem"
+server.ssl.certificate: "/usr/share/wazuh-dashboard/certs/wazuh-dashboard.pem"
+opensearch.ssl.certificateAuthorities: ["/usr/share/wazuh-dashboard/certs/root-ca.pem"]
+
+uiSettings.overrides.defaultRoute: /app/wz-home
+
+# Session expiration (milliseconds). 900000 = 15 minutes.
+opensearch_security.cookie.ttl: 900000
+opensearch_security.session.ttl: 900000
+opensearch_security.session.keepalive: true

@@ -1,0 +1,34 @@
+---
+- name: Template the compose file
+  ansible.builtin.template:
+    src: compose.yaml.j2
+    dest: "{{ wazuh_install_dir }}/compose.yaml"
+    owner: root
+    group: root
+    mode: "0640"
+  # Contains every credential the stack needs.
+  no_log: true
+  register: wazuh_compose_file
+
+- name: Bring up the Wazuh stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ wazuh_install_dir }}"
+    project_name: "{{ wazuh_compose_project }}"
+    files:
+      - compose.yaml
+    state: present
+    # `missing` rather than `always`: pinned tags do not change under us, so
+    # re-pulling on every run would only cost time.
+    pull: missing
+    remove_orphans: true
+  register: wazuh_compose_up
+
+- name: Report what compose did
+  ansible.builtin.debug:
+    msg: >-
+      {{ wazuh_compose_up.actions | map(attribute='what') | list | unique }}
+  # Gated on the action list rather than on `.changed`. Same effect, but
+  # `when: <result>.changed` is the shape of an ad-hoc handler, and ansible-lint
+  # flags it (no-handler) for good reason — it hides a dependency that belongs in
+  # a notify/handler pair.
+  when: wazuh_compose_up.actions | default([]) | length > 0

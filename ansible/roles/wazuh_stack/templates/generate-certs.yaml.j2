@@ -1,0 +1,17 @@
+---
+# MANAGED BY ANSIBLE (role: wazuh_stack)
+#
+# One-shot job, not part of the stack: it writes the certificate bundle into
+# config/wazuh_indexer_ssl_certs/ and exits. Run once, by tasks/certs.yml,
+# guarded on the existence of root-ca.pem.
+services:
+  generator:
+    image: {{ wazuh_certs_generator_image }}
+    hostname: wazuh-certs-generator
+    environment:
+      # Selects which release of wazuh-certs-tool.sh to download. Tracks the
+      # minor line, so 4.14.7 -> 4.14.
+      - CERT_TOOL_VERSION={{ wazuh_cert_tool_version }}
+    volumes:
+      - ./config/wazuh_indexer_ssl_certs/:/certificates/
+      - ./config/certs.yml:/config/certs.yml

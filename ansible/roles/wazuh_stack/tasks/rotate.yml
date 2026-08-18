@@ -1,0 +1,64 @@
+---
+# =============================================================================
+# Applying changed credentials to a running cluster
+# =============================================================================
+# internal_users.yml is read exactly once, while the indexer initialises its
+# security index. After that the index is authoritative and the file is inert.
+# This is the single most common Wazuh surprise: you edit the password, restart
+# the container, and nothing changes.
+#
+# securityadmin.sh is the tool that pushes the on-disk security configuration
+# into the live index. It authenticates with the admin *certificate*, not a
+# password — which is why rotating a forgotten password is still possible.
+#
+# Reached only via `make rotate-passwords`.
+# =============================================================================
+
+- name: Wait for the indexer to accept connections
+  community.docker.docker_container_exec:
+    container: wazuh.indexer
+    argv:
+      - bash
+      - -c
+      - "echo > /dev/tcp/127.0.0.1/9200"
+  register: wazuh_indexer_port_check
+  until: wazuh_indexer_port_check.rc == 0
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Push the security configuration into the live index
+  community.docker.docker_container_exec:
+    container: wazuh.indexer
+    argv:
+      - bash
+      - /usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh
+      - -cd
+      - /usr/share/wazuh-indexer/opensearch-security/
+      - -nhnv
+      - -cacert
+      - /usr/share/wazuh-indexer/config/certs/root-ca.pem
+      - -cert
+      - /usr/share/wazuh-indexer/config/certs/admin.pem
+      - -key
+      - /usr/share/wazuh-indexer/config/certs/admin-key.pem
+      - -p
+      - "9200"
+      - -icl
+    env:
+      JAVA_HOME: /usr/share/wazuh-indexer/jdk
+  register: wazuh_securityadmin
+  changed_when: "'Done with success' in wazuh_securityadmin.stdout"
+
+# The manager's filebeat and the dashboard hold the old password in their
+# environment until they are recreated.
+- name: Recreate the dependent services with the new credentials
+  community.docker.docker_compose_v2:
+    project_src: "{{ wazuh_install_dir }}"
+    project_name: "{{ wazuh_compose_project }}"
+    files:
+      - compose.yaml
+    state: restarted
+    services:
+      - wazuh.manager
+      - wazuh.dashboard

@@ -1,0 +1,117 @@
+---
+# =============================================================================
+# Peers are derived from inventory, never hand-maintained
+# =============================================================================
+# Adding an agent should be one inventory line, not a matching edit to two config
+# files that then have to be kept consistent. So the peer list is computed from the
+# mesh group's hostvars:
+#
+#   hub   peers with every spoke
+#   spoke peers with the hub only  — hub-and-spoke, not a full mesh. Spokes cannot
+#         reach each other, which AllowedIPs then enforces cryptographically.
+#
+# This works in one play because Ansible's default `linear` strategy finishes each
+# task across ALL hosts before starting the next: by the time this file runs, every
+# mesh member has completed keys.yml and published its public key. Both ends must
+# therefore be in the same play — see the mesh play in agent.yml.
+# =============================================================================
+
+- name: Identify the mesh members and the hub
+  ansible.builtin.set_fact:
+    wireguard_mesh_members: "{{ groups[wireguard_mesh_group] | default([]) }}"
+    wireguard_hub: >-
+      {{ groups[wireguard_mesh_group] | default([])
+         | map('extract', hostvars)
+         | selectattr('wireguard_role', 'defined')
+         | selectattr('wireguard_role', 'equalto', 'hub')
+         | map(attribute='inventory_hostname')
+         | list }}
+
+- name: Require exactly one hub in the mesh
+  ansible.builtin.assert:
+    that:
+      - wireguard_hub | length == 1
+    fail_msg: >-
+      Mesh group '{{ wireguard_mesh_group }}' must contain exactly one host with
+      wireguard_role=hub; found {{ wireguard_hub | length }}.
+
+      Members seen: {{ wireguard_mesh_members | join(', ') | default('none', true) }}.
+      An empty list means the mesh group is not defined in your inventory — see
+      ansible/examples/vps.example.
+    quiet: true
+
+- name: Build this host's peer list
+  # A spoke wants the hub; the hub wants the spokes. One expression, both cases.
+  #
+  # `sort` is what makes this ROLE IDEMPOTENT, not a tidiness preference.
+  #
+  # The list starts as `groups[<mesh group>]`, and Ansible does not guarantee a stable
+  # order there across runs — it depends on how the inventory sources and child groups
+  # happened to be parsed. With one spoke that never shows. With three, the peers came out
+  # in a different order on almost every run, so the template rendered
+  # byte-different-but-semantically-identical output and the hub's wg0.conf was rewritten
+  # every single time.
+  #
+  # That is worse than cosmetic churn, for two reasons:
+  #   - it fires the reload handler on every run, and that handler is `wg syncconf`, which
+  #     clears the interface's private key (see handlers/main.yml). So a no-op run was
+  #     silently tearing down the hub's identity and rebuilding it.
+  #   - a role that reports `changed` every time cannot be used to detect real drift: the
+  #     one signal that says "something actually moved" is permanently on.
+  #
+  # Sorted by inventory_hostname because it is unique and stable. wireguard_address would
+  # read more naturally, but Jinja's sort is lexical, so 10.88.0.10 would land before
+  # 10.88.0.2 — deterministic, yet confusing to anyone reading the generated config.
+  ansible.builtin.set_fact:
+    wireguard_peers: >-
+      {{ wireguard_mesh_members
+         | difference([inventory_hostname])
+         | map('extract', hostvars)
+         | selectattr('wireguard_public_key', 'defined')
+         | selectattr('wireguard_role', 'defined')
+         | selectattr('wireguard_role', 'equalto', wireguard_peer_role)
+         | rejectattr('wireguard_address', 'equalto', '')
+         | sort(attribute='inventory_hostname')
+         | list }}
+  vars:
+    wireguard_peer_role: "{{ 'hub' if wireguard_role == 'spoke' else 'spoke' }}"
+
+- name: Report the computed topology
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} ({{ wireguard_role }} {{ wireguard_address }}):
+      {{ wireguard_peers | length }} peer(s) ->
+      {{ wireguard_peers | map(attribute='inventory_hostname') | join(', ') | default('none', true) }}
+
+- name: Fail if a spoke has no hub to talk to
+  # A spoke with an empty peer list produces a valid config that connects to nothing.
+  ansible.builtin.assert:
+    that:
+      - wireguard_peers | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }} is a spoke with no peers. The hub either is not in
+      group '{{ wireguard_mesh_group }}' or did not publish a public key.
+    quiet: true
+  when: wireguard_role == 'spoke'
+
+- name: Deploy the interface configuration
+  ansible.builtin.template:
+    src: wg0.conf.j2
+    dest: "{{ wireguard_dir }}/{{ wireguard_interface }}.conf"
+    owner: root
+    group: root
+    # 0600 even though this file holds no secret (the private key lives in a separate
+    # file — see keys.yml). wg-quick warns about world-readable configs, and the
+    # convention protects whoever later falls back to an inline PrivateKey.
+    mode: "0600"
+    # No `validate:` here on purpose. `wg-quick strip` refuses any path not ending in
+    # .conf, and Ansible's validate hands it an extension-less temp file — so the
+    # check would fail on every valid config. The real file is checked next instead.
+  notify: Reload wireguard
+
+- name: Check that the written configuration parses
+  ansible.builtin.command:
+    cmd: "wg-quick strip {{ wireguard_interface }}"
+  changed_when: false
+  register: wireguard_stripped
+  failed_when: wireguard_stripped.rc != 0

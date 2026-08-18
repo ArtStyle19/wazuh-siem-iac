@@ -1,0 +1,168 @@
+---
+# =============================================================================
+# Verification
+# =============================================================================
+# `docker compose up` returning 0 means the containers were created, not that
+# Wazuh works. These checks assert the three things that actually matter:
+#
+#   1. the indexer formed a cluster and accepts the admin password
+#   2. the manager's API is up and the wazuh-wui credential authenticates
+#   3. the dashboard is serving
+#
+# All three retry, because the indexer takes 1-3 minutes to become available on
+# a 4 GiB host and failing immediately would just be a race.
+# =============================================================================
+
+- name: Confirm the indexer container is not crash-looping
+  # Checked before the health poll, because the two failures look identical from a
+  # timeout but have completely different causes. A container that exits on startup
+  # is reported by `restart: always` as perpetually "Restarting", never as failed —
+  # so a health check would simply time out after ten minutes with no explanation.
+  #
+  # The classic cause is bind-mount ownership: the indexer runs as uid 1000, and a
+  # root-owned 0640 config gives AccessDeniedException on opensearch.yml. See the
+  # ownership note in defaults/main.yml.
+  community.docker.docker_container_info:
+    name: wazuh.indexer
+  register: wazuh_indexer_info
+
+- name: Report the indexer's real state if it is restarting
+  ansible.builtin.fail:
+    msg: |
+      wazuh.indexer is restarting rather than running, so it is exiting on startup.
+      `restart: always` masks this as "Restarting" instead of "failed".
+
+      Restart count: {{ wazuh_indexer_info.container.RestartCount | default('?') }}
+
+      Read the actual error:
+        make logs SERVICE=wazuh.indexer
+
+      Most likely bind-mount ownership. The indexer runs as uid 1000 and cannot read
+      a root-owned config. Check:
+        ls -ln /opt/wazuh/config/wazuh_indexer/
+      Both files should be owned by 1000, not 0.
+  when:
+    - wazuh_indexer_info.container is defined
+    - wazuh_indexer_info.container.State.Restarting | default(false) | bool
+      or (wazuh_indexer_info.container.RestartCount | default(0) | int) > 3
+
+- name: Wait for the indexer cluster to become available
+  # Queried from inside the container: the indexer's port is deliberately not
+  # published to the host, so there is nothing to curl from outside.
+  #
+  # Authenticated with the ADMIN CERTIFICATE, not a password — specifically so that
+  # no credential appears in argv and this task does not need `no_log: true`.
+  #
+  # The previous version passed `--user admin:<password>` and therefore had to be
+  # no_log'd, which meant that when it failed all you got was:
+  #
+  #     fatal: [wazuh-server]: FAILED! =>
+  #       censored: 'the output has been hidden due to ... no_log: true'
+  #
+  # A health check that hides why it is unhealthy is worse than no health check.
+  # This certificate is the same credential securityadmin.sh uses (CN=admin is
+  # listed in plugins.security.authcz.admin_dn), it is already mounted, and it is
+  # readable by the container's uid.
+  community.docker.docker_container_exec:
+    container: wazuh.indexer
+    argv:
+      - curl
+      - --silent
+      - --insecure
+      - --cert
+      - /usr/share/wazuh-indexer/config/certs/admin.pem
+      - --key
+      - /usr/share/wazuh-indexer/config/certs/admin-key.pem
+      - "https://localhost:{{ wazuh_indexer_port }}/_cluster/health"
+  register: wazuh_cluster_health
+  # String matching rather than a JSON parse: on a partial response from_json
+  # would raise instead of retrying, turning a slow start into a hard failure.
+  # yellow is correct and expected — a single-node cluster cannot replicate, so
+  # its replica shards stay unassigned forever.
+  #
+  # The default() guards matter: when the module itself errors, rc and stdout may be
+  # absent, and an undefined-attribute error in an until expression aborts the loop
+  # instead of retrying it.
+  until: >-
+    (wazuh_cluster_health.rc | default(1)) == 0 and
+    ('"status":"green"' in (wazuh_cluster_health.stdout | default('')) or
+     '"status":"yellow"' in (wazuh_cluster_health.stdout | default('')))
+  retries: "{{ wazuh_verify_retries }}"
+  delay: "{{ wazuh_verify_delay }}"
+  changed_when: false
+  # Deliberately no no_log: nothing here is secret, and this task's output is the
+  # single most useful thing to see when the stack will not come up.
+
+- name: Wait for the Wazuh API to respond
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ wazuh_api_port }}/"
+    # Self-signed by the private CA created in certs.yml.
+    validate_certs: false
+    # 401 is the expected answer and counts as success. The Wazuh API root is NOT
+    # anonymous — it replies
+    #   {"title": "Unauthorized", "detail": "No authorization token provided"}
+    # which is proof the API is up, serving TLS, and enforcing authentication. This
+    # check is deliberately about liveness only; the credential is checked next.
+    #
+    # (Verified against a live 4.14.7 deployment. Expecting 200 here fails every
+    # time, which is a check that only ever reports the health of its own
+    # assumption.)
+    status_code: [200, 401]
+  register: wazuh_api_root
+  until: wazuh_api_root.status in [200, 401]
+  retries: "{{ wazuh_verify_retries }}"
+  delay: "{{ wazuh_verify_delay }}"
+
+- name: Verify the API credential authenticates
+  # Distinct from the check above, which only proved something is listening. This
+  # exchanges the wazuh-wui credential for a JWT, so it fails if the password is
+  # wrong or rejected for complexity. A wrong API password presents as an Agents
+  # view that is simply empty — a miserable thing to debug from the UI.
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ wazuh_api_port }}/security/user/authenticate"
+    method: POST
+    validate_certs: false
+    url_username: "{{ wazuh_api_username }}"
+    url_password: "{{ wazuh_api_password }}"
+    force_basic_auth: true
+    status_code: 200
+  register: wazuh_api_auth
+  retries: 10
+  delay: 10
+  until: wazuh_api_auth.status == 200
+  no_log: true
+
+- name: Wait for the dashboard to serve
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ wazuh_dashboard_port }}/app/status"
+    validate_certs: false
+    follow_redirects: none
+    # 302 is a redirect to the login page, which is a working dashboard.
+    status_code: [200, 302]
+  register: wazuh_dashboard_status
+  until: wazuh_dashboard_status.status in [200, 302]
+  retries: "{{ wazuh_verify_retries }}"
+  delay: "{{ wazuh_verify_delay }}"
+
+- name: Collect the running container state
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - --project-name
+      - "{{ wazuh_compose_project }}"
+      - --file
+      - "{{ wazuh_install_dir }}/compose.yaml"
+      - ps
+      - --format
+      - "{{ '{{.Service}} {{.State}}' }}"
+  register: wazuh_ps
+  changed_when: false
+
+- name: Summarise the deployment
+  ansible.builtin.debug:
+    msg: >-
+      Wazuh {{ wazuh_version }} is up.
+      Containers: {{ wazuh_ps.stdout_lines | join(', ') }}.
+      Dashboard: https://{{ ansible_host | default(ansible_default_ipv4.address) }}
+      (log in as {{ wazuh_indexer_username }}).
