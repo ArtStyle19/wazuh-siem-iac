@@ -63,7 +63,7 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keygen -q -t ed25519 -N '' -C 'ci@throwaway' -f ~/.ssh/id_ed25519
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           # We want the real CLI, not the wrapper that rewrites its output.
